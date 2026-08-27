@@ -1,4 +1,5 @@
 import time
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -82,11 +83,17 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     
     return df
 
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_implied_volatility_analytics(ticker: str):
-    """Fetches ATM IV, full option chain skew, and IV term structure across expirations with retries."""
-    for attempt in range(2):
+    """Cached call with standard User-Agent headers to prevent Yahoo Finance options rate limits."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    })
+    
+    for attempt in range(3):
         try:
-            tk = yf.Ticker(ticker)
+            tk = yf.Ticker(ticker, session=session)
             expirations = tk.options
             
             if not expirations:
@@ -147,11 +154,11 @@ def fetch_implied_volatility_analytics(ticker: str):
             return atm_data, skew_df, term_df, None
 
         except Exception as e:
-            if attempt == 1:
+            if attempt == 2:
                 return None, None, None, f"Option analytics error: {str(e)}"
             time.sleep(0.5)
 
-    return None, None, None, "Yahoo Finance rate-limited option chain retrieval. Try re-entering ticker."
+    return None, None, None, "Yahoo Finance rate-limited option chain retrieval. Try clearing cache or re-entering ticker."
 
 def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
     scaled_returns = returns * 100
@@ -164,7 +171,7 @@ def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
 # --- Dashboard Input Controls ---
 col_input, col_bench = st.columns([2, 2])
 with col_input:
-    ticker_input = st.text_input("Enter Equity Ticker:", value="MRNA").upper().strip()
+    ticker_input = st.text_input("Enter Equity Ticker:", value="NOW").upper().strip()
 with col_bench:
     st.text_input("Benchmark Index:", value="^GSPC (S&P 500)", disabled=True)
 
