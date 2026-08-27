@@ -8,6 +8,10 @@ from arch import arch_model
 st.set_page_config(page_title="Volatility Tracker", layout="wide")
 st.title("📈 Volatility Analytics")
 
+# Initialize persistent session state for historical IV tracking
+if 'iv_history' not in st.session_state:
+    st.session_state.iv_history = pd.DataFrame(columns=['Date', 'Ticker', 'ATM_IV'])
+
 @st.cache_data(ttl=1800)
 def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     """Fetches 2-year history for both target stock and benchmark index."""
@@ -19,7 +23,7 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     df['Stock_Close'] = data[ticker]
     df['Index_Close'] = data[index_ticker]
     
-    # Calculate Daily Log Returns
+    # Daily Log Returns
     df['Stock_Return'] = np.log(df['Stock_Close'] / df['Stock_Close'].shift(1))
     df['Index_Return'] = np.log(df['Index_Close'] / df['Index_Close'].shift(1))
     df = df.dropna()
@@ -39,13 +43,10 @@ def fetch_implied_volatility(ticker: str):
     """Retrieves At-The-Money Implied Volatility by scanning upcoming option expiration cycles."""
     try:
         tk = yf.Ticker(ticker)
-        
-        # Check if options exist
         expirations = tk.options
         if not expirations:
             return None, "No option chain listed for this symbol."
         
-        # Fetch underlying stock price
         fast_info = tk.fast_info
         current_price = fast_info.get('lastPrice') or fast_info.get('previousClose')
         
@@ -55,7 +56,6 @@ def fetch_implied_volatility(ticker: str):
                 return None, "Unable to retrieve underlying spot price."
             current_price = hist['Close'].iloc[-1]
 
-        # Scan the first 3 expiration cycles to find a valid ATM contract with non-zero IV
         for exp_date in expirations[:3]:
             try:
                 chain = tk.option_chain(exp_date)
@@ -64,12 +64,10 @@ def fetch_implied_volatility(ticker: str):
                 if calls.empty:
                     continue
                 
-                # Filter out zero/null IV rows
                 valid_calls = calls[calls['impliedVolatility'] > 0.01].copy()
                 if valid_calls.empty:
                     continue
                 
-                # Find contract closest to spot price
                 valid_calls['strike_diff'] = (valid_calls['strike'] - current_price).abs()
                 atm_contract = valid_calls.sort_values('strike_diff').iloc[0]
                 
@@ -107,7 +105,7 @@ with col_bench:
     st.text_input("Benchmark Index:", value="^GSPC (S&P 500)", disabled=True)
 
 if ticker_input:
-    with st.spinner(f"Analyzing volatility and option chains for {ticker_input}..."):
+    with st.spinner(f"Analyzing volatility metrics for {ticker_input}..."):
         df = fetch_stock_and_index_data(ticker_input)
         iv_data, iv_error = fetch_implied_volatility(ticker_input)
         
@@ -118,7 +116,13 @@ if ticker_input:
             index_30d_hv = df['Index_30D_Vol'].iloc[-1]
             garch_30 = fit_garch(df['Stock_Return'])
 
-            # Top Row KPI Cards
+            # Record current IV into time-series tracker
+            today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+            if iv_data:
+                new_entry = pd.DataFrame([{'Date': today_str, 'Ticker': ticker_input, 'ATM_IV': iv_data['iv']}])
+                st.session_state.iv_history = pd.concat([st.session_state.iv_history, new_entry]).drop_duplicates(subset=['Date', 'Ticker'], keep='last')
+
+            # Metric Display
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("30D Realized Vol (Stock)", f"{stock_30d_hv:.2%}")
             m2.metric("30D Realized Vol (S&P 500)", f"{index_30d_hv:.2%}")
@@ -135,21 +139,50 @@ if ticker_input:
 
             st.markdown("---")
 
-            # Chart 1: Stock Volatility vs. S&P 500 Volatility
-            st.subheader(f"Historical 30-Day Volatility: {ticker_input} vs. S&P 500")
+            # Chart 1: Realized Volatility vs. S&P 500
+            st.subheader(f"Historical 30-Day Realized Volatility: {ticker_input} vs. S&P 500")
             fig_vol = go.Figure()
-            fig_vol.add_trace(go.Scatter(x=df.index, y=df['Stock_30D_Vol'], mode='lines', name=f'{ticker_input} 30D Vol', line=dict(width=2)))
-            fig_vol.add_trace(go.Scatter(x=df.index, y=df['Index_30D_Vol'], mode='lines', name='S&P 500 30D Vol', line=dict(dash='dash', color='gray')))
+            fig_vol.add_trace(go.Scatter(x=df.index, y=df['Stock_30D_Vol'], mode='lines', name=f'{ticker_input} 30D HV', line=dict(width=2)))
+            fig_vol.add_trace(go.Scatter(x=df.index, y=df['Index_30D_Vol'], mode='lines', name='S&P 500 30D HV', line=dict(dash='dash', color='gray')))
             fig_vol.update_layout(
                 xaxis_title="Date",
                 yaxis_title="Annualized Volatility",
                 yaxis_tickformat='.0%',
                 template="plotly_white",
-                height=450
+                height=400
             )
             st.plotly_chart(fig_vol, use_container_width=True)
 
-            # Chart 2: Rolling Beta relative to S&P 500
+            # Chart 2: ATM Implied Volatility Time Series Trend
+            st.subheader(f"ATM Implied Volatility (IV) Tracking over Time")
+            ticker_iv_hist = st.session_state.iv_history[st.session_state.iv_history['Ticker'] == ticker_input]
+            
+            fig_iv = go.Figure()
+            # Plot historical 30D realized volatility as baseline
+            fig_iv.add_trace(go.Scatter(x=df.index, y=df['Stock_30D_Vol'], mode='lines', name='30D Realized HV (Baseline)', line=dict(color='lightblue', width=1.5)))
+            
+            # Overlay logged IV snapshots
+            if not ticker_iv_hist.empty:
+                fig_iv.add_trace(go.Scatter(
+                    x=pd.to_datetime(ticker_iv_hist['Date']), 
+                    y=ticker_iv_hist['ATM_IV'], 
+                    mode='lines+markers', 
+                    name='Logged ATM Implied Volatility (IV)',
+                    line=dict(color='orange', width=3),
+                    marker=dict(size=8)
+                ))
+            
+            fig_iv.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Annualized Volatility",
+                yaxis_tickformat='.0%',
+                template="plotly_white",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_iv, use_container_width=True)
+
+            # Chart 3: Rolling Beta
             st.subheader(f"30-Day Rolling Beta ({ticker_input} relative to S&P 500)")
             fig_beta = go.Figure()
             fig_beta.add_trace(go.Scatter(x=df.index, y=df['Rolling_Beta'], mode='lines', name='Beta', line=dict(color='purple')))
@@ -158,6 +191,6 @@ if ticker_input:
                 xaxis_title="Date",
                 yaxis_title="Beta Coefficient",
                 template="plotly_white",
-                height=350
+                height=300
             )
             st.plotly_chart(fig_beta, use_container_width=True)
