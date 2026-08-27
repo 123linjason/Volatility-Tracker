@@ -36,7 +36,7 @@ with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=F
     with col_g3:
         st.markdown("**🔍 Execution & Surface Analytics**")
         st.markdown("""
-        * **Liquidity & Execution Inputs:** Displays bid-ask spread % of premium, open interest, and volume across strikes.
+        * **Liquidity & Execution Inputs:** Displays expiration date, bid-ask spread % of premium, open interest, and volume across strikes.
         * **Volatility Skew & Term Structure:** Evaluates call vs. put demand and term structure regimes (Contango vs. Backwardation).
         """)
 
@@ -56,7 +56,6 @@ def fetch_stock_ohlcv_data(ticker: str, index_ticker: str = "^GSPC"):
         if data.empty:
             return None
         
-        # Format Stock DataFrame
         df_stock = pd.DataFrame()
         df_stock['Open'] = data['Open'][ticker]
         df_stock['High'] = data['High'][ticker]
@@ -200,6 +199,9 @@ def fetch_implied_volatility_analytics(ticker: str):
                         columns={'impliedVolatility': 'Put_IV', 'openInterest': 'Put_OI', 'volume': 'Put_Vol'})
 
                     skew_df = pd.merge(c_sub, p_sub, on='strike', how='outer').sort_values('strike')
+                    
+                    # Insert Expiration Date column at the front
+                    skew_df.insert(0, 'Expiration', exp_date)
                     break
                 except Exception:
                     continue
@@ -297,10 +299,9 @@ if ticker_input:
             
             # Earnings Event Adjustment Calculation
             if event_adjust_toggle and iv_data:
-                # Assume a baseline single-day earnings jump variance (~15% default assumption if unstripped)
                 dte = iv_data['dte']
                 total_variance = (iv_data['iv'] ** 2) * (dte / 365.0)
-                earnings_jump_var = (0.05 ** 2)  # 5% single-day jump proxy
+                earnings_jump_var = (0.05 ** 2)
                 stripped_variance = max(0.0001, total_variance - earnings_jump_var)
                 effective_iv = np.sqrt(stripped_variance * (365.0 / dte))
 
@@ -418,6 +419,7 @@ if ticker_input:
                 st.subheader("Front-Month Option Chain Execution & Liquidity Details")
                 st.dataframe(
                     skew_df.style.format({
+                        'Expiration': '{}',
                         'strike': '${:.2f}',
                         'Call_IV': '{:.2%}',
                         'Put_IV': '{:.2%}',
