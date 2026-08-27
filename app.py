@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -5,12 +6,12 @@ import streamlit as st
 import plotly.graph_objects as go
 from arch import arch_model
 
-st.set_page_config(page_title="Volatility Analytics", layout="wide")
+st.set_page_config(page_title="Enterprise Volatility Analytics", layout="wide")
 
 # Top Navigation Header
 st.title("📈 Enterprise Volatility Analytics")
 
-# --- UI User Guide & Documentation Expander ---
+# --- UI User Guide & Operational Reference ---
 with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=False):
     st.markdown("### Executive Overview")
     st.write(
@@ -39,13 +40,13 @@ with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=F
         st.markdown("""
         * **Historical 30D Realized Volatility:** Plots 30-day rolling HV against the S&P 500 to evaluate regime shifts.
         * **ATM Implied Volatility Logged:** Records live daily ATM IV snapshots to monitor how forward expectations evolve relative to realized volatility.
-        * **30-Day Rolling Beta:** Measures systematic sensitivity to market movements ($\beta = \frac{\text{Cov}(R_s, R_m)}{\text{Var}(R_m)}$).
+        * **30-Day Rolling Beta:** Measures systematic sensitivity to market movements ($\beta = \\frac{\\text{Cov}(R_s, R_m)}{\\text{Var}(R_m)}$).
         """)
 
     with col_g3:
         st.markdown("**🔍 Surface Analytics**")
         st.markdown("""
-        * **Volatility Skew / Smile:** Plots put vs. call IV across strikes for the front-month contract. A elevated put curve signals downside crash protection demand.
+        * **Volatility Skew / Smile:** Plots put vs. call IV across strikes for the front-month contract. An elevated put curve signals downside crash protection demand.
         * **IV Term Structure:** Displays ATM IV across consecutive expiration dates.
           * **Contango (Upward Sloping):** Standard regime where near-term risk is low relative to long-term uncertainty.
           * **Backwardation (Inverted):** Near-term IV exceeds long-term IV, indicating immediate binary event risk (e.g., earnings releases).
@@ -82,73 +83,75 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     return df
 
 def fetch_implied_volatility_analytics(ticker: str):
-    """Fetches ATM IV, full option chain skew, and IV term structure across expirations."""
-    try:
-        tk = yf.Ticker(ticker)
-        expirations = tk.options
-        if not expirations:
-            return None, None, None, "No option chain listed for this symbol."
-        
-        fast_info = tk.fast_info
-        current_price = fast_info.get('lastPrice') or fast_info.get('previousClose')
-        
-        if not current_price:
-            hist = tk.history(period="5d")
-            if hist.empty:
-                return None, None, None, "Unable to retrieve underlying spot price."
-            current_price = hist['Close'].iloc[-1]
+    """Fetches ATM IV, full option chain skew, and IV term structure across expirations with retries."""
+    for attempt in range(2):
+        try:
+            tk = yf.Ticker(ticker)
+            expirations = tk.options
+            
+            if not expirations:
+                time.sleep(0.5)
+                continue
 
-        # 1. Front-Month ATM IV and Skew Chain
-        atm_data = None
-        skew_df = pd.DataFrame()
-        
-        for exp_date in expirations[:3]:
-            try:
-                chain = tk.option_chain(exp_date)
-                calls = chain.calls[chain.calls['impliedVolatility'] > 0.01].copy()
-                puts = chain.puts[chain.puts['impliedVolatility'] > 0.01].copy()
-                
-                if calls.empty:
+            fast_info = tk.fast_info
+            current_price = fast_info.get('lastPrice') or fast_info.get('previousClose')
+            
+            if not current_price:
+                hist = tk.history(period="5d")
+                if hist.empty:
+                    return None, None, None, "Unable to retrieve underlying spot price."
+                current_price = hist['Close'].iloc[-1]
+
+            atm_data = None
+            skew_df = pd.DataFrame()
+            
+            for exp_date in expirations[:3]:
+                try:
+                    chain = tk.option_chain(exp_date)
+                    calls = chain.calls[chain.calls['impliedVolatility'] > 0.01].copy()
+                    puts = chain.puts[chain.puts['impliedVolatility'] > 0.01].copy()
+                    
+                    if calls.empty:
+                        continue
+                    
+                    calls['strike_diff'] = (calls['strike'] - current_price).abs()
+                    atm_contract = calls.sort_values('strike_diff').iloc[0]
+                    
+                    atm_data = {
+                        "iv": float(atm_contract['impliedVolatility']),
+                        "expiration": exp_date,
+                        "strike": float(atm_contract['strike']),
+                        "underlying_price": float(current_price)
+                    }
+                    
+                    calls_skew = calls[(calls['strike'] >= current_price * 0.75) & (calls['strike'] <= current_price * 1.25)][['strike', 'impliedVolatility']].rename(columns={'impliedVolatility': 'Call_IV'})
+                    puts_skew = puts[(puts['strike'] >= current_price * 0.75) & (puts['strike'] <= current_price * 1.25)][['strike', 'impliedVolatility']].rename(columns={'impliedVolatility': 'Put_IV'})
+                    skew_df = pd.merge(calls_skew, puts_skew, on='strike', how='outer').sort_values('strike')
+                    break
+                except Exception:
                     continue
-                
-                calls['strike_diff'] = (calls['strike'] - current_price).abs()
-                atm_contract = calls.sort_values('strike_diff').iloc[0]
-                
-                atm_data = {
-                    "iv": float(atm_contract['impliedVolatility']),
-                    "expiration": exp_date,
-                    "strike": float(atm_contract['strike']),
-                    "underlying_price": float(current_price)
-                }
-                
-                # Filter strikes within +/- 25% of spot price
-                calls_skew = calls[(calls['strike'] >= current_price * 0.75) & (calls['strike'] <= current_price * 1.25)][['strike', 'impliedVolatility']].rename(columns={'impliedVolatility': 'Call_IV'})
-                puts_skew = puts[(puts['strike'] >= current_price * 0.75) & (puts['strike'] <= current_price * 1.25)][['strike', 'impliedVolatility']].rename(columns={'impliedVolatility': 'Put_IV'})
-                
-                skew_df = pd.merge(calls_skew, puts_skew, on='strike', how='outer').sort_values('strike')
-                break
-            except Exception:
-                continue
 
-        # 2. Term Structure across available expirations
-        term_structure = []
-        for exp_date in expirations[:8]:
-            try:
-                c = tk.option_chain(exp_date).calls
-                c_valid = c[c['impliedVolatility'] > 0.01].copy()
-                if not c_valid.empty:
-                    c_valid['strike_diff'] = (c_valid['strike'] - current_price).abs()
-                    atm_row = c_valid.sort_values('strike_diff').iloc[0]
-                    term_structure.append({"Expiration": exp_date, "ATM_IV": float(atm_row['impliedVolatility'])})
-            except Exception:
-                continue
-                
-        term_df = pd.DataFrame(term_structure)
+            term_structure = []
+            for exp_date in expirations[:8]:
+                try:
+                    c = tk.option_chain(exp_date).calls
+                    c_valid = c[c['impliedVolatility'] > 0.01].copy()
+                    if not c_valid.empty:
+                        c_valid['strike_diff'] = (c_valid['strike'] - current_price).abs()
+                        atm_row = c_valid.sort_values('strike_diff').iloc[0]
+                        term_structure.append({"Expiration": exp_date, "ATM_IV": float(atm_row['impliedVolatility'])})
+                except Exception:
+                    continue
+                    
+            term_df = pd.DataFrame(term_structure)
+            return atm_data, skew_df, term_df, None
 
-        return atm_data, skew_df, term_df, None
+        except Exception as e:
+            if attempt == 1:
+                return None, None, None, f"Option analytics error: {str(e)}"
+            time.sleep(0.5)
 
-    except Exception as e:
-        return None, None, None, f"Option analytics error: {str(e)}"
+    return None, None, None, "Yahoo Finance rate-limited option chain retrieval. Try re-entering ticker."
 
 def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
     scaled_returns = returns * 100
