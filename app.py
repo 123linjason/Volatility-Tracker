@@ -37,43 +37,50 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     return df
 
 def fetch_implied_volatility(ticker: str):
-    """Scans nearest option expiration cycles to pull At-The-Money (ATM) Implied Volatility."""
+    """Scans nearest option expirations to locate a valid ATM Implied Volatility."""
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
         if not expirations:
             return None, "No option chain available for this symbol."
         
-        # Grab target stock current price
+        # Get current price
         history = tk.history(period="5d")
         if history.empty:
-            return None, "Could not fetch current price."
+            return None, "Could not fetch current stock price."
         current_price = history['Close'].iloc[-1]
 
-        # Scan the front-month contract expiration (~30 days target)
-        target_exp = expirations[0]
-        opt_chain = tk.option_chain(target_exp)
-        calls = opt_chain.calls
-        
-        if calls.empty:
-            return None, "Empty options chain."
+        # Iterates through up to the first 3 expiration dates to find valid IV data
+        for target_exp in expirations[:3]:
+            try:
+                opt_chain = tk.option_chain(target_exp)
+                calls = opt_chain.calls
+                
+                if calls.empty:
+                    continue
+                
+                # Filter out options with zero or missing IV
+                valid_calls = calls[calls['impliedVolatility'] > 0.001].copy()
+                if valid_calls.empty:
+                    continue
 
-        # Find closest At-The-Money (ATM) strike
-        calls['strike_diff'] = (calls['strike'] - current_price).abs()
-        atm_call = calls.sort_values('strike_diff').iloc[0]
-        
-        iv = atm_call['impliedVolatility']
-        strike = atm_call['strike']
-        
-        if pd.isna(iv) or iv == 0:
-            return None, "Implied Volatility data unavailable for ATM strike."
-            
-        return {
-            "iv": float(iv),
-            "expiration": target_exp,
-            "strike": float(strike),
-            "underlying_price": float(current_price)
-        }, None
+                # Find closest At-The-Money (ATM) strike price
+                valid_calls['strike_diff'] = (valid_calls['strike'] - current_price).abs()
+                atm_call = valid_calls.sort_values('strike_diff').iloc[0]
+                
+                iv = atm_call['impliedVolatility']
+                strike = atm_call['strike']
+                
+                return {
+                    "iv": float(iv),
+                    "expiration": target_exp,
+                    "strike": float(strike),
+                    "underlying_price": float(current_price)
+                }, None
+            except Exception:
+                continue
+
+        return None, "Option data missing or illiquid across near-term expirations."
     except Exception as e:
         return None, f"Error processing options: {str(e)}"
 
