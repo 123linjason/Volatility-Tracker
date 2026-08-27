@@ -3,18 +3,18 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
+import requests
 from arch import arch_model
 
 st.set_page_config(page_title="Volatility Tracker", layout="wide")
 st.title("📈 Enterprise Volatility Analytics")
 
-@st.cache_data(ttl=1800)  # Cache market data for 30 minutes to improve speed
+@st.cache_data(ttl=1800)
 def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     """Fetches 2-year history for both target stock and benchmark index."""
-    # Download batch data for stock and S&P 500
     data = yf.download([ticker, index_ticker], period="2y", progress=False)['Close']
     if data.empty or ticker not in data.columns:
-        return None, None
+        return None
     
     df = pd.DataFrame()
     df['Stock_Close'] = data[ticker]
@@ -36,8 +36,6 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     
     return df
 
-import requests
-
 def fetch_implied_volatility_polygon(ticker: str):
     """Fetches real-time At-The-Money (ATM) Implied Volatility via Polygon.io API."""
     try:
@@ -46,16 +44,16 @@ def fetch_implied_volatility_polygon(ticker: str):
         return None, "Polygon API Key missing in Streamlit Secrets."
 
     try:
-        # 1. Fetch current stock price from Polygon Snapshot
+        # Fetch current stock price from Polygon
         snapshot_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={api_key}"
         snap_res = requests.get(snapshot_url).json()
         
         if 'ticker' not in snap_res:
             return None, f"Ticker '{ticker}' not found on Polygon."
         
-        current_price = snap_res['ticker']['day']['c']  # Latest close / trade price
+        current_price = snap_res['ticker']['day']['c']
 
-        # 2. Query nearest call options chain
+        # Fetch front-month call options chain
         chain_url = (
             f"https://api.polygon.io/v3/snapshot/options/{ticker}"
             f"?contract_type=call&order=asc&sort=expiration_date&limit=100&apiKey={api_key}"
@@ -66,7 +64,6 @@ def fetch_implied_volatility_polygon(ticker: str):
         if not results:
             return None, "No active options contracts returned from Polygon."
 
-        # Filter out contracts with missing IV
         valid_contracts = []
         for contract in results:
             greeks = contract.get('greeks', {})
@@ -85,7 +82,7 @@ def fetch_implied_volatility_polygon(ticker: str):
         if not valid_contracts:
             return None, "No valid IV metrics found across front options contracts."
 
-        # Find closest At-The-Money (ATM) strike
+        # Find closest ATM strike
         valid_contracts.sort(key=lambda x: x['diff'])
         atm_contract = valid_contracts[0]
 
@@ -113,12 +110,12 @@ col_input, col_bench = st.columns([2, 2])
 with col_input:
     ticker_input = st.text_input("Enter Equity Ticker:", value="AAPL").upper().strip()
 with col_bench:
-    index_input = st.text_input("Benchmark Index:", value="^GSPC (" + "S&P 500" + ")", disabled=True)
+    st.text_input("Benchmark Index:", value="^GSPC (S&P 500)", disabled=True)
 
 if ticker_input:
     with st.spinner(f"Analyzing volatility and option chains for {ticker_input}..."):
         df = fetch_stock_and_index_data(ticker_input)
-        iv_data, iv_error = fetch_implied_volatility(ticker_input)
+        iv_data, iv_error = fetch_implied_volatility_polygon(ticker_input)
         
         if df is None or len(df) < 30:
             st.error(f"Could not load sufficient market data for ticker '{ticker_input}'.")
@@ -126,7 +123,6 @@ if ticker_input:
             stock_30d_hv = df['Stock_30D_Vol'].iloc[-1]
             index_30d_hv = df['Index_30D_Vol'].iloc[-1]
             garch_30 = fit_garch(df['Stock_Return'])
-            current_beta = df['Rolling_Beta'].iloc[-1]
 
             # Top Row KPI Cards
             m1, m2, m3, m4 = st.columns(4)
