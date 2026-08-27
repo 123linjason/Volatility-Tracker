@@ -3,11 +3,10 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
-import requests
 from arch import arch_model
 
 st.set_page_config(page_title="Volatility Tracker", layout="wide")
-st.title("📈 Enterprise Volatility Analytics")
+st.title("📈 Volatility Analytics")
 
 @st.cache_data(ttl=1800)
 def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
@@ -36,65 +35,60 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     
     return df
 
-def fetch_implied_volatility_polygon(ticker: str):
-    """Fetches real-time At-The-Money (ATM) Implied Volatility via Polygon.io API."""
+def fetch_implied_volatility(ticker: str):
+    """Retrieves At-The-Money Implied Volatility by scanning upcoming option expiration cycles."""
     try:
-        api_key = st.secrets["POLYGON_API_KEY"]
-    except Exception:
-        return None, "Polygon API Key missing in Streamlit Secrets."
-
-    try:
-        # Fetch current stock price from Polygon
-        snapshot_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={api_key}"
-        snap_res = requests.get(snapshot_url).json()
+        tk = yf.Ticker(ticker)
         
-        if 'ticker' not in snap_res:
-            return None, f"Ticker '{ticker}' not found on Polygon."
+        # Check if options exist
+        expirations = tk.options
+        if not expirations:
+            return None, "No option chain listed for this symbol."
         
-        current_price = snap_res['ticker']['day']['c']
+        # Fetch underlying stock price
+        fast_info = tk.fast_info
+        current_price = fast_info.get('lastPrice') or fast_info.get('previousClose')
+        
+        if not current_price:
+            hist = tk.history(period="5d")
+            if hist.empty:
+                return None, "Unable to retrieve underlying spot price."
+            current_price = hist['Close'].iloc[-1]
 
-        # Fetch front-month call options chain
-        chain_url = (
-            f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-            f"?contract_type=call&order=asc&sort=expiration_date&limit=100&apiKey={api_key}"
-        )
-        chain_res = requests.get(chain_url).json()
+        # Scan the first 3 expiration cycles to find a valid ATM contract with non-zero IV
+        for exp_date in expirations[:3]:
+            try:
+                chain = tk.option_chain(exp_date)
+                calls = chain.calls
+                
+                if calls.empty:
+                    continue
+                
+                # Filter out zero/null IV rows
+                valid_calls = calls[calls['impliedVolatility'] > 0.01].copy()
+                if valid_calls.empty:
+                    continue
+                
+                # Find contract closest to spot price
+                valid_calls['strike_diff'] = (valid_calls['strike'] - current_price).abs()
+                atm_contract = valid_calls.sort_values('strike_diff').iloc[0]
+                
+                iv_val = float(atm_contract['impliedVolatility'])
+                strike_val = float(atm_contract['strike'])
+                
+                return {
+                    "iv": iv_val,
+                    "expiration": exp_date,
+                    "strike": strike_val,
+                    "underlying_price": float(current_price)
+                }, None
+            except Exception:
+                continue
 
-        results = chain_res.get('results', [])
-        if not results:
-            return None, "No active options contracts returned from Polygon."
-
-        valid_contracts = []
-        for contract in results:
-            greeks = contract.get('greeks', {})
-            iv = greeks.get('implied_volatility')
-            strike = contract.get('details', {}).get('strike_price')
-            exp = contract.get('details', {}).get('expiration_date')
-            
-            if iv and iv > 0 and strike:
-                valid_contracts.append({
-                    "iv": iv,
-                    "strike": strike,
-                    "expiration": exp,
-                    "diff": abs(strike - current_price)
-                })
-
-        if not valid_contracts:
-            return None, "No valid IV metrics found across front options contracts."
-
-        # Find closest ATM strike
-        valid_contracts.sort(key=lambda x: x['diff'])
-        atm_contract = valid_contracts[0]
-
-        return {
-            "iv": float(atm_contract['iv']),
-            "expiration": atm_contract['expiration'],
-            "strike": float(atm_contract['strike']),
-            "underlying_price": float(current_price)
-        }, None
+        return None, "No active ATM contract found with valid IV data."
 
     except Exception as e:
-        return None, f"Polygon API Error: {str(e)}"
+        return None, f"Option load error: {str(e)}"
 
 def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
     """Projects forward 30-day volatility using GARCH(1,1)."""
@@ -108,14 +102,14 @@ def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
 # --- Dashboard Layout ---
 col_input, col_bench = st.columns([2, 2])
 with col_input:
-    ticker_input = st.text_input("Enter Equity Ticker:", value="AAPL").upper().strip()
+    ticker_input = st.text_input("Enter Equity Ticker:", value="MRNA").upper().strip()
 with col_bench:
     st.text_input("Benchmark Index:", value="^GSPC (S&P 500)", disabled=True)
 
 if ticker_input:
     with st.spinner(f"Analyzing volatility and option chains for {ticker_input}..."):
         df = fetch_stock_and_index_data(ticker_input)
-        iv_data, iv_error = fetch_implied_volatility_polygon(ticker_input)
+        iv_data, iv_error = fetch_implied_volatility(ticker_input)
         
         if df is None or len(df) < 30:
             st.error(f"Could not load sufficient market data for ticker '{ticker_input}'.")
