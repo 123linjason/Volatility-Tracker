@@ -36,53 +36,68 @@ def fetch_stock_and_index_data(ticker: str, index_ticker: str = "^GSPC"):
     
     return df
 
-def fetch_implied_volatility(ticker: str):
-    """Scans nearest option expirations to locate a valid ATM Implied Volatility."""
+import requests
+
+def fetch_implied_volatility_polygon(ticker: str):
+    """Fetches real-time At-The-Money (ATM) Implied Volatility via Polygon.io API."""
     try:
-        tk = yf.Ticker(ticker)
-        expirations = tk.options
-        if not expirations:
-            return None, "No option chain available for this symbol."
+        api_key = st.secrets["POLYGON_API_KEY"]
+    except Exception:
+        return None, "Polygon API Key missing in Streamlit Secrets."
+
+    try:
+        # 1. Fetch current stock price from Polygon Snapshot
+        snapshot_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}?apiKey={api_key}"
+        snap_res = requests.get(snapshot_url).json()
         
-        # Get current price
-        history = tk.history(period="5d")
-        if history.empty:
-            return None, "Could not fetch current stock price."
-        current_price = history['Close'].iloc[-1]
+        if 'ticker' not in snap_res:
+            return None, f"Ticker '{ticker}' not found on Polygon."
+        
+        current_price = snap_res['ticker']['day']['c']  # Latest close / trade price
 
-        # Iterates through up to the first 3 expiration dates to find valid IV data
-        for target_exp in expirations[:3]:
-            try:
-                opt_chain = tk.option_chain(target_exp)
-                calls = opt_chain.calls
-                
-                if calls.empty:
-                    continue
-                
-                # Filter out options with zero or missing IV
-                valid_calls = calls[calls['impliedVolatility'] > 0.001].copy()
-                if valid_calls.empty:
-                    continue
+        # 2. Query nearest call options chain
+        chain_url = (
+            f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+            f"?contract_type=call&order=asc&sort=expiration_date&limit=100&apiKey={api_key}"
+        )
+        chain_res = requests.get(chain_url).json()
 
-                # Find closest At-The-Money (ATM) strike price
-                valid_calls['strike_diff'] = (valid_calls['strike'] - current_price).abs()
-                atm_call = valid_calls.sort_values('strike_diff').iloc[0]
-                
-                iv = atm_call['impliedVolatility']
-                strike = atm_call['strike']
-                
-                return {
-                    "iv": float(iv),
-                    "expiration": target_exp,
-                    "strike": float(strike),
-                    "underlying_price": float(current_price)
-                }, None
-            except Exception:
-                continue
+        results = chain_res.get('results', [])
+        if not results:
+            return None, "No active options contracts returned from Polygon."
 
-        return None, "Option data missing or illiquid across near-term expirations."
+        # Filter out contracts with missing IV
+        valid_contracts = []
+        for contract in results:
+            greeks = contract.get('greeks', {})
+            iv = greeks.get('implied_volatility')
+            strike = contract.get('details', {}).get('strike_price')
+            exp = contract.get('details', {}).get('expiration_date')
+            
+            if iv and iv > 0 and strike:
+                valid_contracts.append({
+                    "iv": iv,
+                    "strike": strike,
+                    "expiration": exp,
+                    "diff": abs(strike - current_price)
+                })
+
+        if not valid_contracts:
+            return None, "No valid IV metrics found across front options contracts."
+
+        # Find closest At-The-Money (ATM) strike
+        valid_contracts.sort(key=lambda x: x['diff'])
+        atm_contract = valid_contracts[0]
+
+        return {
+            "iv": float(atm_contract['iv']),
+            "expiration": atm_contract['expiration'],
+            "strike": float(atm_contract['strike']),
+            "underlying_price": float(current_price)
+        }, None
+
     except Exception as e:
-        return None, f"Error processing options: {str(e)}"
+        return None, f"Polygon API Error: {str(e)}"
 
 def fit_garch(returns: pd.Series, horizon: int = 30) -> float:
     """Projects forward 30-day volatility using GARCH(1,1)."""
