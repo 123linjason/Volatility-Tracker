@@ -24,7 +24,7 @@ with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=F
         st.markdown("**📊 Relative & Event Metrics**")
         st.markdown("""
         * **1Y IV Rank & Percentile:** Contextualizes current IV relative to its 52-week historical high/low range and distribution.
-        * **Earnings Event Adjustments:** Identifies binary event jumps and strips earnings jump variance out of front-month options.
+        * **Earnings Event Adjustments:** Identifies binary event jumps and strips earnings jump variance out of options.
         * **Dynamic Lookback Window:** Matches option DTE against corresponding realized return horizons (5D, 10D, 30D, 90D).
         """)
     with col_g2:
@@ -83,6 +83,20 @@ def fetch_stock_ohlcv_data(ticker: str, index_ticker: str = "^GSPC"):
     except Exception:
         return None
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_option_expirations(ticker: str):
+    """Retrieves available option expiration dates for a given ticker."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    })
+    try:
+        tk = yf.Ticker(ticker, session=session)
+        expirations = tk.options
+        return list(expirations) if expirations else []
+    except Exception:
+        return []
+
 def calculate_yang_zhang_volatility(df: pd.DataFrame, window: int = 30) -> float:
     """Calculates Yang-Zhang Volatility estimator (overnight, open-to-close, and Rogers-Satchell component)."""
     log_ho = np.log(df['High'] / df['Open'])
@@ -105,8 +119,8 @@ def calculate_yang_zhang_volatility(df: pd.DataFrame, window: int = 30) -> float
     return float(yz_vol.iloc[-1])
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_implied_volatility_analytics(ticker: str):
-    """Fetches option chains, computes execution metrics (bid-ask spread %, volume, OI), and term structure."""
+def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = None):
+    """Fetches option chains for selected expiration, computes execution metrics, and term structure."""
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
@@ -145,16 +159,15 @@ def fetch_implied_volatility_analytics(ticker: str):
             atm_data = None
             skew_df = pd.DataFrame()
             
-            # Process front-month expiration chain
-            for exp_date in expirations[:3]:
-                try:
-                    chain = tk.option_chain(exp_date)
-                    calls = chain.calls[chain.calls['impliedVolatility'] > 0.01].copy()
-                    puts = chain.puts[chain.puts['impliedVolatility'] > 0.01].copy()
-                    
-                    if calls.empty:
-                        continue
-                    
+            # Select target expiration date (default to front-month if none specified or invalid)
+            selected_exp = target_expiration if target_expiration in expirations else expirations[0]
+
+            try:
+                chain = tk.option_chain(selected_exp)
+                calls = chain.calls[chain.calls['impliedVolatility'] > 0.01].copy()
+                puts = chain.puts[chain.puts['impliedVolatility'] > 0.01].copy()
+                
+                if not calls.empty:
                     calls['strike_diff'] = (calls['strike'] - current_price).abs()
                     atm_contract = calls.sort_values('strike_diff').iloc[0]
                     
@@ -165,12 +178,12 @@ def fetch_implied_volatility_analytics(ticker: str):
                     spread_pct = ((ask - bid) / mid) if mid > 0 else 0.0
 
                     # Calculate DTE
-                    dte = (pd.to_datetime(exp_date) - pd.Timestamp.now()).days
+                    dte = (pd.to_datetime(selected_exp) - pd.Timestamp.now()).days
                     dte = max(dte, 1)
 
                     atm_data = {
                         "iv": float(atm_contract['impliedVolatility']),
-                        "expiration": exp_date,
+                        "expiration": selected_exp,
                         "dte": dte,
                         "strike": float(atm_contract['strike']),
                         "underlying_price": float(current_price),
@@ -199,12 +212,9 @@ def fetch_implied_volatility_analytics(ticker: str):
                         columns={'impliedVolatility': 'Put_IV', 'openInterest': 'Put_OI', 'volume': 'Put_Vol'})
 
                     skew_df = pd.merge(c_sub, p_sub, on='strike', how='outer').sort_values('strike')
-                    
-                    # Insert Expiration Date column at the front
-                    skew_df.insert(0, 'Expiration', exp_date)
-                    break
-                except Exception:
-                    continue
+                    skew_df.insert(0, 'Expiration', selected_exp)
+            except Exception:
+                pass
 
             # Term structure analytics
             term_structure = []
@@ -254,26 +264,37 @@ def fit_garch_with_ci(returns: pd.Series, horizon: int = 30):
 
 # --- Dashboard Input Controls & Selectors ---
 
-col_input, col_lookback, col_event = st.columns([1.5, 1.5, 1.5])
+col_input, col_exp, col_lookback, col_event = st.columns([1.2, 1.2, 1.2, 1.2])
 
 with col_input:
     ticker_input = st.text_input("Enter Equity Ticker:", value="NOW").upper().strip()
 
+# Fetch Expirations for the Ticker
+available_expirations = fetch_option_expirations(ticker_input) if ticker_input else []
+
+with col_exp:
+    if available_expirations:
+        selected_expiration = st.selectbox("Select Option Expiration:", options=available_expirations, index=0)
+    else:
+        selected_expiration = st.selectbox("Select Option Expiration:", options=["N/A"], index=0, disabled=True)
+
 with col_lookback:
     lookback_window = st.selectbox(
-        "Realized Volatility Lookback Window:",
+        "Realized Vol Lookback:",
         options=[5, 10, 30, 90],
         index=2,
         format_func=lambda x: f"{x}-Day HV Horizon"
     )
 
 with col_event:
-    event_adjust_toggle = st.checkbox("Event-Adjusted Volatility Mode", value=False, help="Strips expected single-day earnings jump variance out of total implied volatility.")
+    event_adjust_toggle = st.checkbox("Event-Adjusted Vol Mode", value=False, help="Strips expected single-day earnings jump variance out of total implied volatility.")
 
 if ticker_input:
     with st.spinner(f"Processing multi-horizon analytics for {ticker_input}..."):
         df = fetch_stock_ohlcv_data(ticker_input)
-        iv_data, skew_df, term_df, earnings_date, iv_error = fetch_implied_volatility_analytics(ticker_input)
+        iv_data, skew_df, term_df, earnings_date, iv_error = fetch_implied_volatility_analytics(
+            ticker_input, target_expiration=selected_expiration
+        )
         
         if df is None or len(df) < 90:
             st.error(f"Could not load sufficient historical price data for '{ticker_input}'.")
@@ -319,7 +340,7 @@ if ticker_input:
                 m4.metric(
                     "ATM Implied Vol (IV)", 
                     f"{effective_iv:.2%}", 
-                    delta="Event-Adjusted" if event_adjust_toggle else f"Strike ${iv_data['strike']}",
+                    delta="Event-Adjusted" if event_adjust_toggle else f"Exp: {iv_data['expiration']}",
                     delta_color="normal" if not event_adjust_toggle else "inverse"
                 )
                 vrp_ratio = effective_iv / selected_hv if selected_hv > 0 else 0
@@ -392,7 +413,7 @@ if ticker_input:
             # --- Row 4: Advanced Surface Analytics & Execution Table ---
             r2_col1, r2_col2 = st.columns(2)
             with r2_col1:
-                st.subheader("Volatility Skew & Execution Liquidity")
+                st.subheader(f"Volatility Skew ({selected_expiration})")
                 if skew_df is not None and not skew_df.empty:
                     fig_skew = go.Figure()
                     fig_skew.add_trace(go.Scatter(x=skew_df['strike'], y=skew_df['Put_IV'], mode='lines+markers', name='Put IV (Downside Skew)', line=dict(color='red')))
@@ -402,7 +423,7 @@ if ticker_input:
                     fig_skew.update_layout(xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility", yaxis_tickformat='.0%', template="plotly_white", height=350)
                     st.plotly_chart(fig_skew, use_container_width=True)
                 else:
-                    st.info("Volatility skew data unavailable for this ticker.")
+                    st.info("Volatility skew data unavailable for this expiration.")
 
             with r2_col2:
                 st.subheader("IV Term Structure Across Expirations")
@@ -416,7 +437,7 @@ if ticker_input:
 
             # Option Strike Execution & Liquidity Metrics Table
             if skew_df is not None and not skew_df.empty:
-                st.subheader("Front-Month Option Chain Execution & Liquidity Details")
+                st.subheader(f"Option Chain Execution & Liquidity Details ({selected_expiration})")
                 st.dataframe(
                     skew_df.style.format({
                         'Expiration': '{}',
