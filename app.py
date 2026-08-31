@@ -159,7 +159,6 @@ def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = Non
             atm_data = None
             skew_df = pd.DataFrame()
             
-            # Select target expiration date (default to front-month if none specified or invalid)
             selected_exp = target_expiration if target_expiration in expirations else expirations[0]
 
             try:
@@ -171,13 +170,11 @@ def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = Non
                     calls['strike_diff'] = (calls['strike'] - current_price).abs()
                     atm_contract = calls.sort_values('strike_diff').iloc[0]
                     
-                    # Mid-price and Bid-Ask Spread calculation
                     bid = float(atm_contract.get('bid', 0.0))
                     ask = float(atm_contract.get('ask', 0.0))
                     mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(atm_contract.get('lastPrice', 0.0))
                     spread_pct = ((ask - bid) / mid) if mid > 0 else 0.0
 
-                    # Calculate DTE
                     dte = (pd.to_datetime(selected_exp) - pd.Timestamp.now()).days
                     dte = max(dte, 1)
 
@@ -195,11 +192,9 @@ def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = Non
                         "volume": int(atm_contract.get('volume', 0))
                     }
                     
-                    # Filter skew strikes within +/- 25% spot
                     calls_skew = calls[(calls['strike'] >= current_price * 0.75) & (calls['strike'] <= current_price * 1.25)].copy()
                     puts_skew = puts[(puts['strike'] >= current_price * 0.75) & (puts['strike'] <= current_price * 1.25)].copy()
                     
-                    # Add execution metrics to skew table
                     calls_skew['Call_Mid'] = (calls_skew['bid'] + calls_skew['ask']) / 2.0
                     calls_skew['Call_Spread_%'] = np.where(calls_skew['Call_Mid'] > 0, (calls_skew['ask'] - calls_skew['bid']) / calls_skew['Call_Mid'], 0.0)
                     
@@ -216,7 +211,6 @@ def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = Non
             except Exception:
                 pass
 
-            # Term structure analytics
             term_structure = []
             for exp_date in expirations[:8]:
                 try:
@@ -248,11 +242,9 @@ def fit_garch_with_ci(returns: pd.Series, horizon: int = 30):
     forecast = model_fit.forecast(horizon=horizon)
     var_forecast = forecast.variance.iloc[-1]
     
-    # Point Forecast
     avg_daily_var = var_forecast.mean()
     point_forecast = (np.sqrt(avg_daily_var) / 100) * np.sqrt(252)
     
-    # 95% Confidence Intervals via variance standard error approximation
     var_std = var_forecast.std()
     lower_daily_var = max(0.0001, avg_daily_var - 1.96 * var_std)
     upper_daily_var = avg_daily_var + 1.96 * var_std
@@ -261,6 +253,70 @@ def fit_garch_with_ci(returns: pd.Series, horizon: int = 30):
     upper_ci = (np.sqrt(upper_daily_var) / 100) * np.sqrt(252)
     
     return point_forecast, lower_ci, upper_ci
+
+# Helper Function: Text Insight Generator
+def generate_volatility_insights(effective_iv, selected_hv, yz_vol, garch_forecast, garch_lower, garch_upper, iv_rank, iv_percentile, iv_data, event_adjust_toggle, earnings_date):
+    """Generates concise executive text suggestions and tradeable findings based on dashboard data."""
+    insights = []
+    
+    vrp_ratio = (effective_iv / selected_hv) if selected_hv > 0 else 1.0
+    
+    # 1. Mispricing & Valuation Assessment
+    if vrp_ratio > 1.25 and iv_rank > 0.65:
+        insights.append(
+            f"**Overpriced Volatility Edge (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
+            "Implied volatility is trading at a significant premium relative to underlying realized price moves. "
+            "**Actionable Suggestion:** Favor short-volatility structures (e.g., credit spreads, iron condors, or covered calls) to capture premium decay."
+        )
+    elif vrp_ratio < 0.85 and iv_rank < 0.35:
+        insights.append(
+            f"**Underpriced Volatility Opportunity (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
+            "Implied volatility is historically depressed compared to realized volatility. "
+            "**Actionable Suggestion:** Consider long-volatility strategies (e.g., debit calendar spreads or long straddles) to capitalize on potential volatility expansion."
+        )
+    else:
+        insights.append(
+            f"**Fairly Valued Volatility (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
+            "Options market pricing is closely aligned with recent realized volatility. Delta-neutral volatility edges are currently muted."
+        )
+
+    # 2. Advanced Estimator Discrepancy (Yang-Zhang vs Standard HV)
+    if yz_vol > selected_hv * 1.15:
+        insights.append(
+            f"**Intraday Jump / Overnight Gap Risk:** Yang-Zhang volatility ({yz_vol:.1%}) exceeds standard Close-to-Close HV ({selected_hv:.1%}). "
+            "The stock experiences significant overnight gap risk or intraday range expansion that standard close returns miss."
+        )
+
+    # 3. GARCH Range Alignment
+    if effective_iv > garch_upper:
+        insights.append(
+            f"**GARCH Upper Bound Deviation:** Implied volatility ({effective_iv:.1%}) exceeds the 95% GARCH confidence upper limit ({garch_upper:.1%}). "
+            "Option pricing reflects extreme market anxiety beyond statistical conditional expectation."
+        )
+    elif effective_iv < garch_lower:
+        insights.append(
+            f"**GARCH Lower Bound Compression:** Implied volatility ({effective_iv:.1%}) sits below the 95% GARCH lower band ({garch_lower:.1%}). Options appear underpriced relative to conditional persistence."
+        )
+
+    # 4. Liquidity & Execution Assessment
+    if iv_data and iv_data['spread_pct'] > 0.08:
+        insights.append(
+            f"⚠️ **Execution Drag Warning:** Bid-Ask Spread is wide ({iv_data['spread_pct']:.2%} of premium). "
+            "High transaction friction may erase theoretical option mispricing edges. Use strict limit orders at mid-price."
+        )
+    elif iv_data and iv_data['spread_pct'] <= 0.03:
+        insights.append(
+            f"✅ **High Execution Quality:** Tight bid-ask spreads ({iv_data['spread_pct']:.2%}) allow efficient entry/exit with low execution slippage."
+        )
+
+    # 5. Event Risk Impact
+    if event_adjust_toggle:
+        insights.append(
+            f"**Earnings Variance Stripped:** Single-day event jump risk has been removed from front-month options. "
+            f"Effective baseline IV is **{effective_iv:.1%}** (vs. raw market IV)."
+        )
+
+    return insights
 
 # --- Dashboard Input Controls & Selectors ---
 
@@ -348,6 +404,18 @@ if ticker_input:
             else:
                 m4.metric("ATM Implied Vol (IV)", "N/A", delta=iv_error, delta_color="off")
                 m5.metric("Vol Premium (IV / HV)", "N/A")
+
+            # --- Automated Strategy Findings & Suggestions Summary ---
+            st.markdown("---")
+            st.subheader("💡 Automated Volatility Findings & Strategy Suggestions")
+            
+            insights_list = generate_volatility_insights(
+                effective_iv, selected_hv, yz_vol, garch_forecast, garch_lower, garch_upper, 
+                iv_rank, iv_percentile, iv_data, event_adjust_toggle, earnings_date
+            )
+            
+            for insight in insights_list:
+                st.markdown(f"* {insight}")
 
             # --- Row 2: Relative Context Widgets & Execution Summary ---
             st.markdown("---")
