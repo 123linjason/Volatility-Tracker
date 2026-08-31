@@ -40,6 +40,41 @@ with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=F
         * **Volatility Skew & Term Structure:** Evaluates call vs. put demand and term structure regimes (Contango vs. Backwardation).
         """)
 
+# --- NEW: Analytical Methodology & Mathematical Explanations ---
+with st.expander("📚 Educational Guide: Understanding GARCH & Yang-Zhang Volatility", expanded=False):
+    st.markdown("### Deep-Dive: Advanced Volatility Estimators")
+    
+    col_yz, col_garch = st.columns(2)
+    
+    with col_yz:
+        st.markdown("### 1. Yang-Zhang Volatility Estimator")
+        st.markdown("""
+        **What it measures:**
+        Standard historical volatility (HV) only looks at **Close-to-Close** price changes, completely ignoring what happens during the trading day and overnight. The **Yang-Zhang (YZ)** estimator is a multi-bar volatility metric that captures:
+        * **Overnight Volatility:** Price gaps between yesterday's close and today's open.
+        * **Open-to-Close Volatility:** Intraday trend movement.
+        * **Rogers-Satchell Volatility:** Intraday extreme price movement (Highs and Lows relative to Open/Close).
+
+        **Why it matters for trading:**
+        * **Detecting Hidden Risk:** If Yang-Zhang Volatility is significantly *higher* than standard HV, the stock experiences heavy overnight gap risk or violent intraday swings that standard Close-to-Close calculations miss.
+        * **Options Pricing Edge:** Options price total risk (including overnight gaps). Comparing YZ to market ATM IV gives a more accurate picture of whether options are actually cheap or expensive relative to true asset movement.
+        """)
+
+    with col_garch:
+        st.markdown("### 2. GARCH(1,1) Model & Confidence Intervals")
+        st.markdown("""
+        **What it measures:**
+        **GARCH** stands for *Generalized Autoregressive Conditional Heteroskedasticity*. Unlike standard historical volatility (which treats all past days equally), GARCH recognizes two real-world market facts:
+        1. **Volatility Clustering:** High volatility days tend to follow high volatility days; quiet days follow quiet days.
+        2. **Mean Reversion:** Volatility eventually pulls back toward its long-term average.
+
+        **Why it matters for trading:**
+        * **Forward Statistical Expectations:** GARCH generates a forecast of expected volatility over your lookback horizon alongside **95% Confidence Intervals (Upper and Lower Bands)**.
+        * **Evaluating Option Mispricings:** 
+          * If market **Implied Volatility (IV) > GARCH Upper Band**, options are pricing in extreme panic/fear far beyond statistical expectations (potential **Short Volatility / Sell Premium** edge).
+          * If market **Implied Volatility (IV) < GARCH Lower Band**, options are pricing in an unusually calm environment, underestimating potential variance (potential **Long Volatility / Buy Premium** edge).
+        """)
+
 st.markdown("---")
 
 # Initialize session state for IV history tracking
@@ -283,19 +318,20 @@ def generate_volatility_insights(effective_iv, selected_hv, yz_vol, garch_foreca
     # 2. Advanced Estimator Discrepancy (Yang-Zhang vs Standard HV)
     if yz_vol > selected_hv * 1.15:
         insights.append(
-            f"**Intraday Jump / Overnight Gap Risk:** Yang-Zhang volatility ({yz_vol:.1%}) exceeds standard Close-to-Close HV ({selected_hv:.1%}). "
-            "The stock experiences significant overnight gap risk or intraday range expansion that standard close returns miss."
+            f"**Yang-Zhang Gap/Intraday Risk Signal:** Yang-Zhang volatility ({yz_vol:.1%}) significantly exceeds standard Close-to-Close HV ({selected_hv:.1%}). "
+            "This indicates substantial overnight price gapping or intraday high/low volatility that standard close returns miss."
         )
 
     # 3. GARCH Range Alignment
     if effective_iv > garch_upper:
         insights.append(
-            f"**GARCH Upper Bound Deviation:** Implied volatility ({effective_iv:.1%}) exceeds the 95% GARCH confidence upper limit ({garch_upper:.1%}). "
-            "Option pricing reflects extreme market anxiety beyond statistical conditional expectation."
+            f"**GARCH Upper Bound Deviation:** Implied volatility ({effective_iv:.1%}) sits above the 95% GARCH conditional upper limit ({garch_upper:.1%}). "
+            "Option pricing reflects extreme market anxiety beyond statistical expectations (Potential short volatility / sell edge)."
         )
     elif effective_iv < garch_lower:
         insights.append(
-            f"**GARCH Lower Bound Compression:** Implied volatility ({effective_iv:.1%}) sits below the 95% GARCH lower band ({garch_lower:.1%}). Options appear underpriced relative to conditional persistence."
+            f"**GARCH Lower Bound Compression:** Implied volatility ({effective_iv:.1%}) sits below the 95% GARCH lower band ({garch_lower:.1%}). "
+            "Options appear underpriced relative to statistical conditional persistence (Potential long volatility edge)."
         )
 
     # 4. Liquidity & Execution Assessment
