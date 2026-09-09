@@ -77,12 +77,13 @@ st.markdown("""
         border-radius: 4px;
         margin-bottom: 8px;
     }
-    .news-title { font-size: 13px; font-weight: 600; color: #ffffff; }
+    .news-title { font-size: 13px; font-weight: 600; color: #ffffff; text-decoration: none; }
+    .news-title:hover { color: #2962ff; text-decoration: underline; }
     .news-meta { font-size: 11px; color: #848e9c; margin-top: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
-# Sector Peer Industry Mapping for Dynamic Auto-Population
+# Sector Peer Mapping for Dynamic Sidebar Auto-Population
 DEFAULT_SECTOR_PEERS = {
     "NVDA": "AMD, AVGO, INTC, TSM, QCOM, MU",
     "AMD": "NVDA, AVGO, INTC, TSM, QCOM, MU",
@@ -153,20 +154,19 @@ def fetch_financial_data(ticker_symbol):
         info = ticker.info if ticker.info else {}
         raw_news = ticker.news if hasattr(ticker, 'news') else []
 
-        # Process and Clean News Data
+        # Parse News Articles & Hyperlinks
         parsed_news = []
         for item in raw_news:
-            # Handle nested provider/content structures from yfinance API
             title = item.get('title') or item.get('content', {}).get('title', 'Corporate News Update')
             publisher = item.get('publisher') or item.get('content', {}).get('provider', {}).get('displayName', 'Financial News')
-            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational update and financial performance headline.')
-            pub_date = item.get('providerPublishTime') or item.get('content', {}).get('pubDate', '')
+            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational news and market performance headline.')
+            link = item.get('link') or item.get('content', {}).get('canonicalUrl', {}).get('url', '#')
             
             parsed_news.append({
                 "title": title,
                 "publisher": publisher,
                 "summary": summary[:180] + "..." if len(summary) > 180 else summary,
-                "date": pub_date
+                "link": link
             })
 
         return {
@@ -294,14 +294,14 @@ def process_quarterly_fundamentals_extended(q_df, info_dict):
     else:
         summary['Quarterly EPS ($)'] = np.nan
 
-    # Calculate Growth Rates across available quarters
+    # Calculate Growth Rates across all available quarters (up to 24)
     summary['QoQ Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(1) * 100
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
 
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
 
-    # Calculate TTM (Rolling 4 Quarters)
+    # TTM (Rolling 4 Quarters)
     summary['Annual Sales (TTM)'] = summary['Quarterly Revenue ($)'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['Quarterly EPS ($)'].rolling(window=4, min_periods=1).sum()
 
@@ -317,7 +317,7 @@ def process_quarterly_fundamentals_extended(q_df, info_dict):
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    # Convert index to Quarter Label (e.g. Q2 2026)
+    # Label X-Axis with Fiscal Quarter & Year
     summary['Quarter_Label'] = [date_to_quarter_str(d) for d in summary.index]
 
     return summary.sort_index(ascending=False), latest_accel_q
@@ -380,7 +380,7 @@ def render_technical_chart(df_price):
 
 @st.fragment
 def render_fundamental_chart_24q(q_summary):
-    """Renders up to 24 quarters of Revenue ($) and YoY EPS Growth (%) with Quarter/Year X-Axis."""
+    """Renders up to 24 quarters of Revenue ($) and YoY EPS Growth (%) with Quarter & Year X-Axis."""
     q_plot = q_summary.tail(24).sort_index(ascending=True)
     
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -576,15 +576,15 @@ if ticker_input:
                 st.dataframe(inst_df, use_container_width=True)
 
             st.markdown("---")
-            st.markdown("### 🚀 Corporate News Intelligence & Recent Headlines")
-            st.caption("Real-time headline digests summarizing operational catalysts without external links.")
+            st.markdown("### 🚀 Material Growth Catalysts & Corporate Intelligence")
+            st.caption("Real-time headline summaries and hyperlinked news articles from primary sources.")
             
             news_list = data.get('news', [])
             if news_list:
                 for item in news_list[:6]:
                     st.markdown(f"""
                     <div class="news-card">
-                        <div class="news-title">{item['title']}</div>
+                        <a href="{item['link']}" target="_blank" class="news-title">{item['title']} ↗</a>
                         <div class="news-meta">Source: {item['publisher']}</div>
                         <div style="font-size: 12px; color: #d1d4dc; margin-top: 4px;">{item['summary']}</div>
                     </div>
