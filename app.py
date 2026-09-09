@@ -1,568 +1,390 @@
-import time
-import requests
-import numpy as np
-import pandas as pd
-import yfinance as yf
 import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
-from arch import arch_model
+from plotly.subplots import make_subplots
+from scipy.signal import find_peaks
+import datetime
 
-st.set_page_config(page_title="Enterprise Volatility Analytics", layout="wide")
+# ==========================================
+# PAGE CONFIGURATION & SETUP
+# ==========================================
+st.set_page_config(
+    page_title="CAN SLIM Equity Analytics",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.title("📈 Enterprise Volatility Analytics")
-
-# --- UI User Guide & Operational Reference ---
-with st.expander("📖 Dashboard User Guide & Operational Reference", expanded=False):
-    st.markdown("### Executive Overview")
-    st.write(
-        "This dashboard provides a comprehensive framework for identifying tradeable option mispricings by comparing "
-        "options market implied volatility against historical context, event risks, execution costs, and advanced volatility estimators."
-    )
-    st.markdown("---")
-    col_g1, col_g2, col_g3 = st.columns(3)
-    with col_g1:
-        st.markdown("**📊 Relative & Event Metrics**")
-        st.markdown("""
-        * **1Y IV Rank & Percentile:** Contextualizes current IV relative to its 52-week historical high/low range and distribution.
-        * **Earnings Event Adjustments:** Identifies binary event jumps and strips earnings jump variance out of options.
-        * **Dynamic Lookback Window:** Matches option DTE against corresponding realized return horizons (5D, 10D, 30D, 90D).
-        """)
-    with col_g2:
-        st.markdown("**📈 Advanced Estimators**")
-        st.markdown("""
-        * **Yang-Zhang Volatility:** Drift and jump-robust multi-bar estimator combining overnight gaps and intraday high/low ranges.
-        * **GARCH(1,1) 95% CI:** Provides forward expected volatility bands to establish realistic price targets.
-        """)
-    with col_g3:
-        st.markdown("**🔍 Execution & Surface Analytics**")
-        st.markdown("""
-        * **Liquidity & Execution Inputs:** Displays expiration date, bid-ask spread % of premium, open interest, and volume across strikes.
-        * **Volatility Skew & Term Structure:** Evaluates call vs. put demand and term structure regimes (Contango vs. Backwardation).
-        """)
-
-# --- NEW: Analytical Methodology & Mathematical Explanations ---
-with st.expander("📚 Educational Guide: Understanding GARCH & Yang-Zhang Volatility", expanded=False):
-    st.markdown("### Deep-Dive: Advanced Volatility Estimators")
-    
-    col_yz, col_garch = st.columns(2)
-    
-    with col_yz:
-        st.markdown("### 1. Yang-Zhang Volatility Estimator")
-        st.markdown("""
-        **What it measures:**
-        Standard historical volatility (HV) only looks at **Close-to-Close** price changes, completely ignoring what happens during the trading day and overnight. The **Yang-Zhang (YZ)** estimator is a multi-bar volatility metric that captures:
-        * **Overnight Volatility:** Price gaps between yesterday's close and today's open.
-        * **Open-to-Close Volatility:** Intraday trend movement.
-        * **Rogers-Satchell Volatility:** Intraday extreme price movement (Highs and Lows relative to Open/Close).
-
-        **Why it matters for trading:**
-        * **Detecting Hidden Risk:** If Yang-Zhang Volatility is significantly *higher* than standard HV, the stock experiences heavy overnight gap risk or violent intraday swings that standard Close-to-Close calculations miss.
-        * **Options Pricing Edge:** Options price total risk (including overnight gaps). Comparing YZ to market ATM IV gives a more accurate picture of whether options are actually cheap or expensive relative to true asset movement.
-        """)
-
-    with col_garch:
-        st.markdown("### 2. GARCH(1,1) Model & Confidence Intervals")
-        st.markdown("""
-        **What it measures:**
-        **GARCH** stands for *Generalized Autoregressive Conditional Heteroskedasticity*. Unlike standard historical volatility (which treats all past days equally), GARCH recognizes two real-world market facts:
-        1. **Volatility Clustering:** High volatility days tend to follow high volatility days; quiet days follow quiet days.
-        2. **Mean Reversion:** Volatility eventually pulls back toward its long-term average.
-
-        **Why it matters for trading:**
-        * **Forward Statistical Expectations:** GARCH generates a forecast of expected volatility over your lookback horizon alongside **95% Confidence Intervals (Upper and Lower Bands)**.
-        * **Evaluating Option Mispricings:** 
-          * If market **Implied Volatility (IV) > GARCH Upper Band**, options are pricing in extreme panic/fear far beyond statistical expectations (potential **Short Volatility / Sell Premium** edge).
-          * If market **Implied Volatility (IV) < GARCH Lower Band**, options are pricing in an unusually calm environment, underestimating potential variance (potential **Long Volatility / Buy Premium** edge).
-        """)
-
-st.markdown("---")
-
-# Initialize session state for IV history tracking
-if 'iv_history' not in st.session_state:
-    st.session_state.iv_history = pd.DataFrame(columns=['Date', 'Ticker', 'ATM_IV'])
-
-# --- Data Helper Functions ---
-
-@st.cache_data(ttl=1800)
-def fetch_stock_ohlcv_data(ticker: str, index_ticker: str = "^GSPC"):
-    """Fetches OHLCV data for Yang-Zhang estimator and multi-horizon HV calculations."""
+# ==========================================
+# DATA RETRIEVAL ENGINE
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_financial_data(ticker_symbol):
+    """
+    Fetches maximum historical price data, benchmark data (S&P 500), 
+    quarterly/annual financial statements, and metadata via yfinance.
+    """
     try:
-        data = yf.download([ticker, index_ticker], period="2y", progress=False)
-        if data.empty:
-            return None
+        ticker = yf.Ticker(ticker_symbol)
         
-        df_stock = pd.DataFrame()
-        df_stock['Open'] = data['Open'][ticker]
-        df_stock['High'] = data['High'][ticker]
-        df_stock['Low'] = data['Low'][ticker]
-        df_stock['Close'] = data['Close'][ticker]
-        df_stock['Index_Close'] = data['Close'][index_ticker]
-        df_stock = df_stock.dropna()
+        # 1. Fetch Price History (Max Period)
+        df_price = ticker.history(period="max", interval="1d")
+        if df_price.empty:
+            return None, "No price data found for ticker."
+        
+        # Ensure UTC tz-naive datetime index
+        if df_price.index.tz is not None:
+            df_price.index = df_price.index.tz_localize(None)
 
-        # Log Returns
-        df_stock['Stock_Return'] = np.log(df_stock['Close'] / df_stock['Close'].shift(1))
-        df_stock['Index_Return'] = np.log(df_stock['Index_Close'] / df_stock['Index_Close'].shift(1))
-
-        # Realized Volatilities across Lookback Windows
-        for window in [5, 10, 30, 90]:
-            df_stock[f'HV_{window}D'] = df_stock['Stock_Return'].rolling(window=window).std() * np.sqrt(252)
-
-        df_stock['Index_30D_Vol'] = df_stock['Index_Return'].rolling(window=30).std() * np.sqrt(252)
-
-        # Rolling 30D Beta
-        rolling_cov = df_stock['Stock_Return'].rolling(window=30).cov(df_stock['Index_Return'])
-        rolling_var = df_stock['Index_Return'].rolling(window=30).var()
-        df_stock['Rolling_Beta'] = rolling_cov / rolling_var
-
-        return df_stock.dropna()
-    except Exception:
-        return None
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_option_expirations(ticker: str):
-    """Retrieves available option expiration dates for a given ticker."""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-    })
-    try:
-        tk = yf.Ticker(ticker, session=session)
-        expirations = tk.options
-        return list(expirations) if expirations else []
-    except Exception:
-        return []
-
-def calculate_yang_zhang_volatility(df: pd.DataFrame, window: int = 30) -> float:
-    """Calculates Yang-Zhang Volatility estimator (overnight, open-to-close, and Rogers-Satchell component)."""
-    log_ho = np.log(df['High'] / df['Open'])
-    log_lo = np.log(df['Low'] / df['Open'])
-    log_co = np.log(df['Close'] / df['Open'])
-    log_oc = np.log(df['Open'] / df['Close'].shift(1))
-    
-    # Rogers-Satchell Volatility
-    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    rs_vol = rs.rolling(window=window).mean()
-    
-    # Overnight and Open-to-Close variances
-    v_overnight = log_oc.rolling(window=window).var()
-    v_open_to_close = log_co.rolling(window=window).var()
-    
-    k = 0.34 / (1.34 + (window + 1) / (window - 1))
-    yz_variance = v_overnight + k * v_open_to_close + (1 - k) * rs_vol
-    
-    yz_vol = np.sqrt(np.maximum(yz_variance, 0)) * np.sqrt(252)
-    return float(yz_vol.iloc[-1])
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_implied_volatility_analytics(ticker: str, target_expiration: str = None):
-    """Fetches option chains for selected expiration, computes execution metrics, and term structure."""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-    })
-    
-    for attempt in range(3):
-        try:
-            tk = yf.Ticker(ticker, session=session)
-            expirations = tk.options
+        # Fetch Benchmark Data (S&P 500)
+        sp500 = yf.Ticker("^GSPC").history(period="max", interval="1d")
+        if sp500.index.tz is not None:
+            sp500.index = sp500.index.tz_localize(None)
             
-            if not expirations:
-                time.sleep(0.5)
-                continue
+        # Merge S&P 500 Close into Price DataFrame
+        df_price = df_price.join(sp500['Close'].rename('SP500_Close'), how='left')
+        df_price['SP500_Close'] = df_price['SP500_Close'].ffill().bfill()
+        
+        # 2. Financial Statements (Quarterly & Annual)
+        q_financials = ticker.quarterly_financials
+        q_income = ticker.quarterly_incomestmt
+        a_financials = ticker.financials
+        a_balance = ticker.balance_sheet
 
-            fast_info = tk.fast_info
-            current_price = fast_info.get('lastPrice') or fast_info.get('previousClose')
-            
-            if not current_price:
-                hist = tk.history(period="5d")
-                if hist.empty:
-                    return None, None, None, None, "Unable to retrieve underlying spot price."
-                current_price = hist['Close'].iloc[-1]
+        # Merge available income data
+        q_combined = q_financials if not q_financials.empty else q_income
+        
+        # 3. Metadata & Key Ratios
+        info = ticker.info if ticker.info else {}
 
-            # Earnings date retrieval
-            earnings_date_str = "N/A"
-            try:
-                cal = tk.calendar
-                if isinstance(cal, pd.DataFrame) and not cal.empty:
-                    if 'Earnings Date' in cal.index:
-                        earnings_date_str = str(cal.loc['Earnings Date'].iloc[0].date())
-                elif isinstance(cal, dict) and 'Earnings Date' in cal:
-                    earnings_date_str = str(cal['Earnings Date'][0])
-            except Exception:
-                pass
+        return {
+            "price_data": df_price,
+            "q_financials": q_combined,
+            "a_financials": a_financials,
+            "a_balance": a_balance,
+            "info": info,
+            "ticker_obj": ticker
+        }, None
+        
+    except Exception as e:
+        return None, str(e)
 
-            atm_data = None
-            skew_df = pd.DataFrame()
-            
-            selected_exp = target_expiration if target_expiration in expirations else expirations[0]
-
-            try:
-                chain = tk.option_chain(selected_exp)
-                calls = chain.calls[chain.calls['impliedVolatility'] > 0.01].copy()
-                puts = chain.puts[chain.puts['impliedVolatility'] > 0.01].copy()
-                
-                if not calls.empty:
-                    calls['strike_diff'] = (calls['strike'] - current_price).abs()
-                    atm_contract = calls.sort_values('strike_diff').iloc[0]
-                    
-                    bid = float(atm_contract.get('bid', 0.0))
-                    ask = float(atm_contract.get('ask', 0.0))
-                    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(atm_contract.get('lastPrice', 0.0))
-                    spread_pct = ((ask - bid) / mid) if mid > 0 else 0.0
-
-                    dte = (pd.to_datetime(selected_exp) - pd.Timestamp.now()).days
-                    dte = max(dte, 1)
-
-                    atm_data = {
-                        "iv": float(atm_contract['impliedVolatility']),
-                        "expiration": selected_exp,
-                        "dte": dte,
-                        "strike": float(atm_contract['strike']),
-                        "underlying_price": float(current_price),
-                        "bid": bid,
-                        "ask": ask,
-                        "mid": mid,
-                        "spread_pct": spread_pct,
-                        "open_interest": int(atm_contract.get('openInterest', 0)),
-                        "volume": int(atm_contract.get('volume', 0))
-                    }
-                    
-                    calls_skew = calls[(calls['strike'] >= current_price * 0.75) & (calls['strike'] <= current_price * 1.25)].copy()
-                    puts_skew = puts[(puts['strike'] >= current_price * 0.75) & (puts['strike'] <= current_price * 1.25)].copy()
-                    
-                    calls_skew['Call_Mid'] = (calls_skew['bid'] + calls_skew['ask']) / 2.0
-                    calls_skew['Call_Spread_%'] = np.where(calls_skew['Call_Mid'] > 0, (calls_skew['ask'] - calls_skew['bid']) / calls_skew['Call_Mid'], 0.0)
-                    
-                    puts_skew['Put_Mid'] = (puts_skew['bid'] + puts_skew['ask']) / 2.0
-                    puts_skew['Put_Spread_%'] = np.where(puts_skew['Put_Mid'] > 0, (puts_skew['ask'] - puts_skew['bid']) / puts_skew['Put_Mid'], 0.0)
-
-                    c_sub = calls_skew[['strike', 'impliedVolatility', 'Call_Spread_%', 'openInterest', 'volume']].rename(
-                        columns={'impliedVolatility': 'Call_IV', 'openInterest': 'Call_OI', 'volume': 'Call_Vol'})
-                    p_sub = puts_skew[['strike', 'impliedVolatility', 'Put_Spread_%', 'openInterest', 'volume']].rename(
-                        columns={'impliedVolatility': 'Put_IV', 'openInterest': 'Put_OI', 'volume': 'Put_Vol'})
-
-                    skew_df = pd.merge(c_sub, p_sub, on='strike', how='outer').sort_values('strike')
-                    skew_df.insert(0, 'Expiration', selected_exp)
-            except Exception:
-                pass
-
-            term_structure = []
-            for exp_date in expirations[:8]:
-                try:
-                    c = tk.option_chain(exp_date).calls
-                    c_valid = c[c['impliedVolatility'] > 0.01].copy()
-                    if not c_valid.empty:
-                        c_valid['strike_diff'] = (c_valid['strike'] - current_price).abs()
-                        atm_row = c_valid.sort_values('strike_diff').iloc[0]
-                        term_structure.append({"Expiration": exp_date, "ATM_IV": float(atm_row['impliedVolatility'])})
-                except Exception:
-                    continue
-                    
-            term_df = pd.DataFrame(term_structure)
-            return atm_data, skew_df, term_df, earnings_date_str, None
-
-        except Exception as e:
-            if attempt == 2:
-                return None, None, None, None, f"Option analytics error: {str(e)}"
-            time.sleep(0.5)
-
-    return None, None, None, None, "Yahoo Finance rate-limited option chain retrieval. Try re-entering ticker."
-
-def fit_garch_with_ci(returns: pd.Series, horizon: int = 30):
-    """Fits GARCH(1,1) model and returns point forecast alongside 95% Confidence Intervals."""
-    scaled_returns = returns * 100
-    model = arch_model(scaled_returns, vol='GARCH', p=1, q=1, mean='constant', dist='normal')
-    model_fit = model.fit(disp='off')
+# ==========================================
+# ANALYTICS & CAN SLIM HEURISTICS ENGINE
+# ==========================================
+def calculate_technicals(df):
+    """Calculates 10-week (50-day) and 40-week (200-day) SMAs, volume surges, and relative strength."""
+    df = df.copy()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()   # ~10-Week SMA
+    df['SMA_200'] = df['Close'].rolling(window=200).mean() # ~40-Week SMA
     
-    forecast = model_fit.forecast(horizon=horizon)
-    var_forecast = forecast.variance.iloc[-1]
+    # Volume Spikes (40-50%+ above 50-day average volume)
+    df['Vol_SMA_50'] = df['Volume'].rolling(window=50).mean()
+    df['Volume_Surge'] = (df['Volume'] >= 1.45 * df['Vol_SMA_50'])
     
-    avg_daily_var = var_forecast.mean()
-    point_forecast = (np.sqrt(avg_daily_var) / 100) * np.sqrt(252)
+    # Relative Performance vs S&P 500 (Indexed at 100)
+    stock_perf = df['Close'] / df['Close'].iloc[0]
+    sp_perf = df['SP500_Close'] / df['SP500_Close'].iloc[0]
+    df['RS_Line'] = (stock_perf / sp_perf) * 100
     
-    var_std = var_forecast.std()
-    lower_daily_var = max(0.0001, avg_daily_var - 1.96 * var_std)
-    upper_daily_var = avg_daily_var + 1.96 * var_std
-    
-    lower_ci = (np.sqrt(lower_daily_var) / 100) * np.sqrt(252)
-    upper_ci = (np.sqrt(upper_daily_var) / 100) * np.sqrt(252)
-    
-    return point_forecast, lower_ci, upper_ci
+    return df
 
-# Helper Function: Text Insight Generator
-def generate_volatility_insights(effective_iv, selected_hv, yz_vol, garch_forecast, garch_lower, garch_upper, iv_rank, iv_percentile, iv_data, event_adjust_toggle, earnings_date):
-    """Generates concise executive text suggestions and tradeable findings based on dashboard data."""
-    insights = []
+def process_quarterly_fundamentals(q_df):
+    """Processes quarterly EPS and Revenue to compute YoY Growth and Acceleration."""
+    if q_df is None or q_df.empty:
+        return pd.DataFrame()
     
-    vrp_ratio = (effective_iv / selected_hv) if selected_hv > 0 else 1.0
+    # Extract Net Income & Total Revenue
+    df = q_df.T.copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    eps_col = [c for c in df.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c) or 'Net Income' in str(c)]
+    rev_col = [c for c in df.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
     
-    # 1. Mispricing & Valuation Assessment
-    if vrp_ratio > 1.25 and iv_rank > 0.65:
-        insights.append(
-            f"**Overpriced Volatility Edge (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
-            "Implied volatility is trading at a significant premium relative to underlying realized price moves. "
-            "**Actionable Suggestion:** Favor short-volatility structures (e.g., credit spreads, iron condors, or covered calls) to capture premium decay."
-        )
-    elif vrp_ratio < 0.85 and iv_rank < 0.35:
-        insights.append(
-            f"**Underpriced Volatility Opportunity (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
-            "Implied volatility is historically depressed compared to realized volatility. "
-            "**Actionable Suggestion:** Consider long-volatility strategies (e.g., debit calendar spreads or long straddles) to capitalize on potential volatility expansion."
-        )
+    col_eps = eps_col[0] if eps_col else None
+    col_rev = rev_col[0] if rev_col else None
+
+    summary = pd.DataFrame(index=df.index)
+    
+    if col_eps:
+        summary['EPS'] = pd.to_numeric(df[col_eps], errors='coerce')
+        summary['EPS_YoY_Growth_%'] = summary['EPS'].pct_change(4) * 100
     else:
-        insights.append(
-            f"**Fairly Valued Volatility (Vol Premium: {vrp_ratio:.2f}x | 1Y IV Rank: {iv_rank:.1%}):** "
-            "Options market pricing is closely aligned with recent realized volatility. Delta-neutral volatility edges are currently muted."
-        )
+        summary['EPS'] = np.nan
+        summary['EPS_YoY_Growth_%'] = np.nan
 
-    # 2. Advanced Estimator Discrepancy (Yang-Zhang vs Standard HV)
-    if yz_vol > selected_hv * 1.15:
-        insights.append(
-            f"**Yang-Zhang Gap/Intraday Risk Signal:** Yang-Zhang volatility ({yz_vol:.1%}) significantly exceeds standard Close-to-Close HV ({selected_hv:.1%}). "
-            "This indicates substantial overnight price gapping or intraday high/low volatility that standard close returns miss."
-        )
-
-    # 3. GARCH Range Alignment
-    if effective_iv > garch_upper:
-        insights.append(
-            f"**GARCH Upper Bound Deviation:** Implied volatility ({effective_iv:.1%}) sits above the 95% GARCH conditional upper limit ({garch_upper:.1%}). "
-            "Option pricing reflects extreme market anxiety beyond statistical expectations (Potential short volatility / sell edge)."
-        )
-    elif effective_iv < garch_lower:
-        insights.append(
-            f"**GARCH Lower Bound Compression:** Implied volatility ({effective_iv:.1%}) sits below the 95% GARCH lower band ({garch_lower:.1%}). "
-            "Options appear underpriced relative to statistical conditional persistence (Potential long volatility edge)."
-        )
-
-    # 4. Liquidity & Execution Assessment
-    if iv_data and iv_data['spread_pct'] > 0.08:
-        insights.append(
-            f"⚠️ **Execution Drag Warning:** Bid-Ask Spread is wide ({iv_data['spread_pct']:.2%} of premium). "
-            "High transaction friction may erase theoretical option mispricing edges. Use strict limit orders at mid-price."
-        )
-    elif iv_data and iv_data['spread_pct'] <= 0.03:
-        insights.append(
-            f"✅ **High Execution Quality:** Tight bid-ask spreads ({iv_data['spread_pct']:.2%}) allow efficient entry/exit with low execution slippage."
-        )
-
-    # 5. Event Risk Impact
-    if event_adjust_toggle:
-        insights.append(
-            f"**Earnings Variance Stripped:** Single-day event jump risk has been removed from front-month options. "
-            f"Effective baseline IV is **{effective_iv:.1%}** (vs. raw market IV)."
-        )
-
-    return insights
-
-# --- Dashboard Input Controls & Selectors ---
-
-col_input, col_exp, col_lookback, col_event = st.columns([1.2, 1.2, 1.2, 1.2])
-
-with col_input:
-    ticker_input = st.text_input("Enter Equity Ticker:", value="NOW").upper().strip()
-
-# Fetch Expirations for the Ticker
-available_expirations = fetch_option_expirations(ticker_input) if ticker_input else []
-
-with col_exp:
-    if available_expirations:
-        selected_expiration = st.selectbox("Select Option Expiration:", options=available_expirations, index=0)
+    if col_rev:
+        summary['Revenue'] = pd.to_numeric(df[col_rev], errors='coerce')
+        summary['Revenue_YoY_Growth_%'] = summary['Revenue'].pct_change(4) * 100
     else:
-        selected_expiration = st.selectbox("Select Option Expiration:", options=["N/A"], index=0, disabled=True)
+        summary['Revenue'] = np.nan
+        summary['Revenue_YoY_Growth_%'] = np.nan
 
-with col_lookback:
-    lookback_window = st.selectbox(
-        "Realized Vol Lookback:",
-        options=[5, 10, 30, 90],
-        index=2,
-        format_func=lambda x: f"{x}-Day HV Horizon"
+    # Acceleration Flag (YoY Growth greater than prior quarter's YoY Growth)
+    summary['EPS_Accelerating'] = summary['EPS_YoY_Growth_%'] > summary['EPS_YoY_Growth_%'].shift(1)
+    summary['Deceleration_Streak'] = (
+        (summary['EPS_YoY_Growth_%'] < summary['EPS_YoY_Growth_%'].shift(1)) & 
+        (summary['EPS_YoY_Growth_%'].shift(1) < summary['EPS_YoY_Growth_%'].shift(2))
     )
+    
+    return summary.sort_index(ascending=False)
 
-with col_event:
-    event_adjust_toggle = st.checkbox("Event-Adjusted Vol Mode", value=False, help="Strips expected single-day earnings jump variance out of total implied volatility.")
+def detect_chart_patterns(df):
+    """Algorithmic heuristic for detecting consolidation, breakout, and Cup with Handle bases."""
+    if len(df) < 200:
+        return {"Pattern": "Insufficient Data", "Confidence": "Low", "Breakout": False}
+    
+    recent_df = df.tail(150)
+    highs = recent_df['High'].values
+    lows = recent_df['Low'].values
+    
+    # Identify Prominent Peaks & Troughs
+    peaks, _ = find_peaks(highs, distance=20)
+    troughs, _ = find_peaks(-lows, distance=20)
+    
+    pattern_detected = "Consolidation / Base"
+    breakout_signaled = False
+    
+    if len(peaks) >= 2 and len(troughs) >= 1:
+        left_rim = highs[peaks[0]]
+        bottom = lows[troughs[0]]
+        right_rim = highs[peaks[-1]]
+        
+        # Cup Depth Criteria (12% to 35% depth)
+        depth = (left_rim - bottom) / left_rim
+        if 0.12 <= depth <= 0.40 and abs(left_rim - right_rim) / left_rim <= 0.15:
+            pattern_detected = "Cup with Handle Pattern"
+            
+    # Check Breakout near 52-Week High with Volume Surge
+    max_52w = df['High'].tail(252).max()
+    latest_close = df['Close'].iloc[-1]
+    latest_vol_surge = df['Volume_Surge'].iloc[-1]
+    above_10w = latest_close > df['SMA_50'].iloc[-1]
+    
+    if (latest_close >= 0.95 * max_52w) and latest_vol_surge and above_10w:
+        breakout_signaled = True
+
+    return {
+        "Pattern": pattern_detected,
+        "Breakout": breakout_signaled,
+        "Near_52W_High": latest_close >= 0.95 * max_52w,
+        "Above_10W_SMA": above_10w
+    }
+
+# ==========================================
+# APPLICATION DASHBOARD UI
+# ==========================================
+st.title("📈 CAN SLIM Equity Analytics Dashboard")
+st.caption("Quantitative screening based on William O'Neil's *How to Make Money in Stocks* principles.")
+
+# Sidebar Configuration
+st.sidebar.header("User Settings")
+ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
+st.sidebar.markdown("---")
+st.sidebar.markdown("**CAN SLIM Key Filters**")
+st.sidebar.markdown("- **C**: Accelerating Quarterly EPS (+20% to +40%+)")
+st.sidebar.markdown("- **A**: Strong Annual EPS Growth & ROE ≥ 17%")
+st.sidebar.markdown("- **N**: New Highs, Products, Management")
+st.sidebar.markdown("- **S**: High Volume Demand at Base Breakout")
+st.sidebar.markdown("- **L**: Relative Strength Leader vs S&P 500")
+st.sidebar.markdown("- **I**: Institutional Sponsorship & Ownership")
+st.sidebar.markdown("- **M**: Market Direction Harmony")
 
 if ticker_input:
-    with st.spinner(f"Processing multi-horizon analytics for {ticker_input}..."):
-        df = fetch_stock_ohlcv_data(ticker_input)
-        iv_data, skew_df, term_df, earnings_date, iv_error = fetch_implied_volatility_analytics(
-            ticker_input, target_expiration=selected_expiration
-        )
+    with st.spinner(f"Retrieving full history and fundamentals for {ticker_input}..."):
+        data, err = fetch_financial_data(ticker_input)
+
+    if err or data is None:
+        st.error(f"Error fetching data for '{ticker_input}': {err}")
+    else:
+        # Unpack Data
+        df_price = calculate_technicals(data['price_data'])
+        q_summary = process_quarterly_fundamentals(data['q_financials'])
+        pattern_info = detect_chart_patterns(df_price)
+        info = data['info']
+
+        # Metric Overview Top Panel
+        col1, col2, col3, col4, col5 = st.columns(5)
+        latest_price = df_price['Close'].iloc[-1]
+        prev_price = df_price['Close'].iloc[-2]
+        chg = ((latest_price - prev_price) / prev_price) * 100
         
-        if df is None or len(df) < 90:
-            st.error(f"Could not load sufficient historical price data for '{ticker_input}'.")
-        else:
-            selected_hv = df[f'HV_{lookback_window}D'].iloc[-1]
-            index_30d_hv = df['Index_30D_Vol'].iloc[-1]
-            yz_vol = calculate_yang_zhang_volatility(df, window=lookback_window)
-            garch_forecast, garch_lower, garch_upper = fit_garch_with_ci(df['Stock_Return'], horizon=lookback_window)
+        col1.metric("Current Price", f"${latest_price:,.2f}", f"{chg:+.2f}%")
+        col2.metric("52-Week Range", f"${df_price['Low'].tail(252).min():,.2f} - ${df_price['High'].tail(252).max():,.2f}")
+        col3.metric("Market Cap", f"${info.get('marketCap', 0):,}" if info.get('marketCap') else "N/A")
+        col4.metric("ROE", f"{info.get('returnOnEquity', 0)*100:.2f}%" if info.get('returnOnEquity') else "N/A")
+        col5.metric("Base Pattern Detected", pattern_info['Pattern'])
 
-            today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
-            
-            # Session State IV History and IV Rank / Percentile Calculation
-            if iv_data:
-                new_entry = pd.DataFrame([{'Date': today_str, 'Ticker': ticker_input, 'ATM_IV': iv_data['iv']}])
-                st.session_state.iv_history = pd.concat([st.session_state.iv_history, new_entry]).drop_duplicates(subset=['Date', 'Ticker'], keep='last')
-            
-            # Derive 1Y IV Rank & Percentile using rolling historical baseline proxy
-            historical_vol_series = df['HV_30D'].dropna()
-            iv_min_52w = historical_vol_series.min()
-            iv_max_52w = historical_vol_series.max()
-            
-            effective_iv = iv_data['iv'] if iv_data else selected_hv
-            
-            # Earnings Event Adjustment Calculation
-            if event_adjust_toggle and iv_data:
-                dte = iv_data['dte']
-                total_variance = (iv_data['iv'] ** 2) * (dte / 365.0)
-                earnings_jump_var = (0.05 ** 2)
-                stripped_variance = max(0.0001, total_variance - earnings_jump_var)
-                effective_iv = np.sqrt(stripped_variance * (365.0 / dte))
+        # Multi-Tab Layout
+        tab_tech, tab_fund, tab_pattern, tab_catalyst = st.tabs([
+            "📊 Technicals & Relative Strength",
+            "📑 Historical Fundamentals (C & A)",
+            "🎯 Pattern Signals & Alerts",
+            "🚀 Corporate Catalysts (N, S, I)"
+        ])
 
-            iv_rank = (effective_iv - iv_min_52w) / (iv_max_52w - iv_min_52w) if (iv_max_52w > iv_min_52w) else 0.5
-            iv_percentile = (historical_vol_series < effective_iv).mean()
-
-            # --- Row 1: Key Relative Context & Event Indicators ---
-            m1, m2, m3, m4, m5 = st.columns(5)
+        # -------------------------------------------------------------
+        # TAB 1: TECHNICALS & RELATIVE STRENGTH
+        # -------------------------------------------------------------
+        with tab_tech:
+            st.subheader("Price History, Moving Averages & Volume Demand Spikes")
             
-            m1.metric(f"Realized Vol ({lookback_window}D)", f"{selected_hv:.2%}", help=f"Annualized {lookback_window}-day HV")
-            m2.metric("Yang-Zhang Volatility", f"{yz_vol:.2%}", help="Overnight + intraday drift-robust estimator")
-            m3.metric("GARCH 95% Target Range", f"{garch_forecast:.1%}", delta=f"[{garch_lower:.1%} - {garch_upper:.1%}]", delta_color="off")
-            
-            if iv_data:
-                m4.metric(
-                    "ATM Implied Vol (IV)", 
-                    f"{effective_iv:.2%}", 
-                    delta="Event-Adjusted" if event_adjust_toggle else f"Exp: {iv_data['expiration']}",
-                    delta_color="normal" if not event_adjust_toggle else "inverse"
-                )
-                vrp_ratio = effective_iv / selected_hv if selected_hv > 0 else 0
-                m5.metric("Vol Premium (IV / HV)", f"{vrp_ratio:.2f}x", delta="Expensive Options" if vrp_ratio > 1.0 else "Cheap Options", delta_color="normal" if vrp_ratio > 1.0 else "inverse")
+            # Date Range Selector
+            chart_range = st.radio("Chart Timeframe", ["1 Year", "5 Years", "Max History"], index=2, horizontal=True)
+            if chart_range == "1 Year":
+                plot_df = df_price.tail(252)
+            elif chart_range == "5 Years":
+                plot_df = df_price.tail(252 * 5)
             else:
-                m4.metric("ATM Implied Vol (IV)", "N/A", delta=iv_error, delta_color="off")
-                m5.metric("Vol Premium (IV / HV)", "N/A")
+                plot_df = df_price
 
-            # --- Automated Strategy Findings & Suggestions Summary ---
-            st.markdown("---")
-            st.subheader("💡 Automated Volatility Findings & Strategy Suggestions")
-            
-            insights_list = generate_volatility_insights(
-                effective_iv, selected_hv, yz_vol, garch_forecast, garch_lower, garch_upper, 
-                iv_rank, iv_percentile, iv_data, event_adjust_toggle, earnings_date
+            # Interactive Plotly Subplots
+            fig = make_subplots(
+                rows=3, cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0.03, 
+                subplot_titles=(f"{ticker_input} Price & Moving Averages", "Daily Trading Volume", "Relative Strength vs S&P 500"),
+                row_heights=[0.5, 0.25, 0.25]
             )
+
+            # Row 1: Candlesticks & SMAs
+            fig.add_trace(go.Candlestick(
+                x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
+                low=plot_df['Low'], close=plot_df['Close'], name="Price"
+            ), row=1, col=1)
             
-            for insight in insights_list:
-                st.markdown(f"* {insight}")
-
-            # --- Row 2: Relative Context Widgets & Execution Summary ---
-            st.markdown("---")
-            c_rank, c_perc, c_earn, c_exec = st.columns(4)
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['SMA_50'], name="10-Week SMA (50-Day)",
+                line=dict(color='blue', width=1.5)
+            ), row=1, col=1)
             
-            with c_rank:
-                st.metric("1-Year IV Rank", f"{iv_rank:.1%}", help="Location relative to 52-week IV high/low range")
-                st.progress(min(max(iv_rank, 0.0), 1.0))
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['SMA_200'], name="40-Week SMA (200-Day)",
+                line=dict(color='red', width=1.5)
+            ), row=1, col=1)
+
+            # Row 2: Volume Spikes
+            colors = ['green' if surge else 'gray' for surge in plot_df['Volume_Surge']]
+            fig.add_trace(go.Bar(
+                x=plot_df.index, y=plot_df['Volume'], name="Volume", marker_color=colors
+            ), row=2, col=1)
+            
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['Vol_SMA_50'], name="50-Day Vol Avg",
+                line=dict(color='orange', width=1)
+            ), row=2, col=1)
+
+            # Row 3: RS Line vs S&P 500
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['RS_Line'], name="RS Line vs S&P 500",
+                line=dict(color='purple', width=2)
+            ), row=3, col=1)
+
+            fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # -------------------------------------------------------------
+        # TAB 2: HISTORICAL FUNDAMENTALS (CAN SLIM C & A)
+        # -------------------------------------------------------------
+        with tab_fund:
+            st.subheader("Quarterly Earnings Acceleration & Revenue Trajectory")
+            
+            if not q_summary.empty:
+                col_f1, col_f2 = st.columns([2, 1])
                 
-            with c_perc:
-                st.metric("1-Year IV Percentile", f"{iv_percentile:.1%}", help="% of days over trailing year where IV was lower")
-                st.progress(min(max(iv_percentile, 0.0), 1.0))
+                with col_f1:
+                    # Quarterly Plot
+                    fig_fund = make_subplots(specs=[[{"secondary_y": True}]])
+                    fig_fund.add_trace(go.Bar(
+                        x=q_summary.index, y=q_summary['EPS'], name="Quarterly EPS", marker_color='darkblue'
+                    ), secondary_y=False)
+                    
+                    fig_fund.add_trace(go.Scatter(
+                        x=q_summary.index, y=q_summary['EPS_YoY_Growth_%'], name="EPS YoY Growth %",
+                        line=dict(color='darkgreen', width=3)
+                    ), secondary_y=True)
+                    
+                    fig_fund.update_layout(title_text="Historical Quarterly EPS & YoY Growth Rate", template="plotly_white")
+                    fig_fund.update_yaxes(title_text="EPS ($)", secondary_y=False)
+                    fig_fund.update_yaxes(title_text="YoY Growth (%)", secondary_y=True)
+                    st.plotly_chart(fig_fund, use_container_width=True)
 
-            with c_earn:
-                st.metric("Upcoming Earnings Date", earnings_date if earnings_date != "N/A" else "None Listed")
-                if event_adjust_toggle:
-                    st.caption("⚡ Single-day earnings jump risk stripped from IV.")
-                else:
-                    st.caption("📌 Raw market IV active (includes event jump).")
+                with col_f2:
+                    st.markdown("**CAN SLIM Earnings Diagnostic**")
+                    if not q_summary['EPS_YoY_Growth_%'].dropna().empty:
+                        latest_eps_growth = q_summary['EPS_YoY_Growth_%'].dropna().iloc[0]
+                        st.metric("Latest YoY EPS Growth", f"{latest_eps_growth:+.2f}%")
+                        if latest_eps_growth >= 20.0:
+                            st.success("Passes CAN SLIM criteria: High quarterly growth (≥20%).")
+                        else:
+                            st.warning("Below CAN SLIM benchmark of 20%+ quarterly growth.")
+                            
+                    # Deceleration Check
+                    if len(q_summary) >= 3 and q_summary['Deceleration_Streak'].iloc[0]:
+                        st.error("🚨 Warning: Two consecutive quarters of EPS deceleration detected (Sell Alert Criteria).")
+                    else:
+                        st.info("No consecutive quarterly deceleration detected.")
 
-            with c_exec:
-                if iv_data:
-                    st.metric("Execution Spread (%)", f"{iv_data['spread_pct']:.2%}", delta=f"Mid: ${iv_data['mid']:.2f}")
-                    st.caption(f"Volume: {iv_data['volume']:,} | OI: {iv_data['open_interest']:,}")
-                else:
-                    st.metric("Execution Spread (%)", "N/A")
+                st.markdown("### Complete Historical Quarterly Fundamentals Table")
+                st.dataframe(q_summary.style.highlight_max(axis=0, subset=['EPS_YoY_Growth_%']), use_container_width=True)
+            else:
+                st.warning("Quarterly fundamental data is unavailable for this ticker.")
 
-            st.markdown("---")
-
-            # --- Row 3: Primary Volatility Trend Charts ---
-            r1_col1, r1_col2 = st.columns(2)
-            with r1_col1:
-                st.subheader(f"Historical Realized Volatility ({lookback_window}D Lookback)")
-                fig_vol = go.Figure()
-                fig_vol.add_trace(go.Scatter(x=df.index, y=df[f'HV_{lookback_window}D'], mode='lines', name=f'{ticker_input} {lookback_window}D HV', line=dict(width=2)))
-                fig_vol.add_trace(go.Scatter(x=df.index, y=df['Index_30D_Vol'], mode='lines', name='S&P 500 30D HV', line=dict(dash='dash', color='gray')))
-                fig_vol.update_layout(xaxis_title="Date", yaxis_title="Annualized Volatility", yaxis_tickformat='.0%', template="plotly_white", height=350)
-                st.plotly_chart(fig_vol, use_container_width=True)
-
-            with r1_col2:
-                st.subheader("ATM Implied Volatility Tracking & GARCH Bands")
-                ticker_iv_hist = st.session_state.iv_history[st.session_state.iv_history['Ticker'] == ticker_input]
-                fig_iv = go.Figure()
-                fig_iv.add_trace(go.Scatter(x=df.index, y=df[f'HV_{lookback_window}D'], mode='lines', name=f'{lookback_window}D Realized HV', line=dict(color='lightblue', width=1.5)))
+        # -------------------------------------------------------------
+        # TAB 3: PATTERN SIGNALS & ALERTS
+        # -------------------------------------------------------------
+        with tab_pattern:
+            st.subheader("Algorithmic Buy / Sell Alerts & Chart Patterns")
+            
+            c_b1, c_b2 = st.columns(2)
+            
+            with c_b1:
+                st.markdown("### 🟢 Buy Signal Evaluation")
+                buy_1 = pattern_info['Near_52W_High']
+                buy_2 = df_price['Volume_Surge'].iloc[-1]
+                buy_3 = pattern_info['Above_10W_SMA']
                 
-                # Plot GARCH Forecast Target Band
-                last_date = df.index[-1]
-                fig_iv.add_trace(go.Scatter(
-                    x=[last_date], y=[garch_upper],
-                    mode='markers', name='GARCH 95% Upper CI', marker=dict(color='red', size=8, symbol='triangle-up')
-                ))
-                fig_iv.add_trace(go.Scatter(
-                    x=[last_date], y=[garch_lower],
-                    mode='markers', name='GARCH 95% Lower CI', marker=dict(color='green', size=8, symbol='triangle-down')
-                ))
-
-                if not ticker_iv_hist.empty:
-                    fig_iv.add_trace(go.Scatter(x=pd.to_datetime(ticker_iv_hist['Date']), y=ticker_iv_hist['ATM_IV'], mode='lines+markers', name='Logged ATM IV', line=dict(color='orange', width=2.5), marker=dict(size=6)))
+                st.write(f"- Near 52-Week High (within 5%): {'✅ Yes' if buy_1 else '❌ No'}")
+                st.write(f"- Heavy Volume Demand Spike (≥40% above avg): {'✅ Yes' if buy_2 else '❌ No'}")
+                st.write(f"- Trading Above 10-Week (50-Day) SMA: {'✅ Yes' if buy_3 else '❌ No'}")
                 
-                fig_iv.update_layout(xaxis_title="Date", yaxis_title="Annualized Volatility", yaxis_tickformat='.0%', template="plotly_white", height=350)
-                st.plotly_chart(fig_iv, use_container_width=True)
-
-            # --- Row 4: Advanced Surface Analytics & Execution Table ---
-            r2_col1, r2_col2 = st.columns(2)
-            with r2_col1:
-                st.subheader(f"Volatility Skew ({selected_expiration})")
-                if skew_df is not None and not skew_df.empty:
-                    fig_skew = go.Figure()
-                    fig_skew.add_trace(go.Scatter(x=skew_df['strike'], y=skew_df['Put_IV'], mode='lines+markers', name='Put IV (Downside Skew)', line=dict(color='red')))
-                    fig_skew.add_trace(go.Scatter(x=skew_df['strike'], y=skew_df['Call_IV'], mode='lines+markers', name='Call IV (Upside Skew)', line=dict(color='green')))
-                    if iv_data:
-                        fig_skew.add_vline(x=iv_data['underlying_price'], line_dash="dash", line_color="black", annotation_text=f"Spot ${iv_data['underlying_price']:.2f}")
-                    fig_skew.update_layout(xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility", yaxis_tickformat='.0%', template="plotly_white", height=350)
-                    st.plotly_chart(fig_skew, use_container_width=True)
+                if buy_1 and buy_2 and buy_3:
+                    st.success("🔥 BUY ALERT: Stock meets classic CAN SLIM breakout criteria!")
                 else:
-                    st.info("Volatility skew data unavailable for this expiration.")
+                    st.info("Stock is not currently triggering a classic breakout buy signal.")
 
-            with r2_col2:
-                st.subheader("IV Term Structure Across Expirations")
-                if term_df is not None and not term_df.empty:
-                    fig_term = go.Figure()
-                    fig_term.add_trace(go.Scatter(x=term_df['Expiration'], y=term_df['ATM_IV'], mode='lines+markers', name='ATM IV Term Curve', line=dict(color='purple', width=2.5)))
-                    fig_term.update_layout(xaxis_title="Option Expiration Date", yaxis_title="ATM Implied Volatility", yaxis_tickformat='.0%', template="plotly_white", height=350)
-                    st.plotly_chart(fig_term, use_container_width=True)
+            with c_b2:
+                st.markdown("### 🔴 Risk & Stop-Loss Rule")
+                st.warning("Rule: Always enforce a strict maximum stop-loss at 8% below your purchase/breakout entry point.")
+                
+                entry_price = st.number_input("Enter Your Entry Purchase Price ($)", value=float(round(latest_price, 2)))
+                stop_loss_price = entry_price * 0.92
+                st.markdown(f"**Calculated Cut-Loss Trigger Price (-8%):** `${stop_loss_price:,.2f}`")
+                
+                if latest_price <= stop_loss_price:
+                    st.error("🚨 STOP-LOSS ALERT: Current price has fallen 8% or more below entry point! Cut losses quickly.")
                 else:
-                    st.info("Term structure data unavailable for this ticker.")
+                    st.success("Current price is above the -8% stop-loss threshold.")
 
-            # Option Strike Execution & Liquidity Metrics Table
-            if skew_df is not None and not skew_df.empty:
-                st.subheader(f"Option Chain Execution & Liquidity Details ({selected_expiration})")
-                st.dataframe(
-                    skew_df.style.format({
-                        'Expiration': '{}',
-                        'strike': '${:.2f}',
-                        'Call_IV': '{:.2%}',
-                        'Put_IV': '{:.2%}',
-                        'Call_Spread_%': '{:.2%}',
-                        'Put_Spread_%': '{:.2%}',
-                        'Call_OI': '{:,.0f}',
-                        'Put_OI': '{:,.0f}',
-                        'Call_Vol': '{:,.0f}',
-                        'Put_Vol': '{:,.0f}'
-                    }),
-                    use_container_width=True,
-                    height=250
-                )
-
-            # --- Row 5: Dynamic Rolling Beta ---
-            st.subheader(f"30-Day Rolling Beta ({ticker_input} vs. S&P 500)")
-            fig_beta = go.Figure()
-            fig_beta.add_trace(go.Scatter(x=df.index, y=df['Rolling_Beta'], mode='lines', name='Beta', line=dict(color='teal')))
-            fig_beta.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Market Beta (1.0)")
-            fig_beta.update_layout(xaxis_title="Date", yaxis_title="Beta Coefficient", template="plotly_white", height=280)
-            st.plotly_chart(fig_beta, use_container_width=True)
+        # -------------------------------------------------------------
+        # TAB 4: CORPORATE CATALYSTS (N, S, I FACTORS)
+        # -------------------------------------------------------------
+        with tab_catalyst:
+            st.subheader("Qualitative Metrics, Institutional Sponsorship & Supply Dynamics")
+            
+            col_c1, col_c2 = st.columns(2)
+            
+            with col_c1:
+                st.markdown("### **N** - New Products, Management & Highs")
+                st.write(f"**Business Overview:** {info.get('longBusinessSummary', 'N/A')}")
+                
+            with col_c2:
+                st.markdown("### **S** & **I** Factors - Supply, Demand & Sponsorship")
+                st.write(f"- **Floating Shares:** {info.get('floatShares', 0):,}" if info.get('floatShares') else "- Floating Shares: N/A")
+                st.write(f"- **Insider Ownership:** {info.get('heldPercentInsiders', 0)*100:.2f}%" if info.get('heldPercentInsiders') else "- Insider Ownership: N/A")
+                st.write(f"- **Institutional Ownership:** {info.get('heldPercentInstitutions', 0)*100:.2f}%" if info.get('heldPercentInstitutions') else "- Institutional Ownership: N/A")
+                st.write(f"- **Debt-to-Equity:** {info.get('debtToEquity', 'N/A')}")
+                st.write(f"- **Forward P/E Ratio:** {info.get('forwardPE', 'N/A')}")
