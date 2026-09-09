@@ -5,10 +5,9 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import find_peaks
-import datetime
 
 # ==========================================
-# PAGE CONFIGURATION & SETUP
+# PAGE CONFIGURATION & CUSTOM CSS
 # ==========================================
 st.set_page_config(
     page_title="CAN SLIM Equity Analytics",
@@ -17,15 +16,56 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Custom CSS to eliminate truncation in metric headers
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #1e222d;
+        border: 1px solid #2a2e39;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
+    }
+    .metric-title {
+        color: #8f929d;
+        font-size: 13px;
+        font-weight: 500;
+        margin-bottom: 4px;
+        white-space: nowrap;
+    }
+    .metric-value {
+        color: #ffffff;
+        font-size: 20px;
+        font-weight: 700;
+        word-wrap: break-word;
+        white-space: normal;
+    }
+    .metric-sub {
+        font-size: 13px;
+        margin-top: 4px;
+    }
+    .text-green { color: #089981; }
+    .text-red { color: #f23645; }
+</style>
+""", unsafe_allow_html=True)
+
+# Helper function to format large market cap figures cleanly
+def format_large_number(num):
+    if num is None or np.isnan(num):
+        return "N/A"
+    if num >= 1e12:
+        return f"${num/1e12:,.2f}T"
+    if num >= 1e9:
+        return f"${num/1e9:,.2f}B"
+    if num >= 1e6:
+        return f"${num/1e6:,.2f}M"
+    return f"${num:,.2f}"
+
 # ==========================================
 # DATA RETRIEVAL ENGINE
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financial_data(ticker_symbol):
-    """
-    Fetches maximum historical price data, benchmark data (S&P 500), 
-    quarterly/annual financial statements, and metadata via yfinance.
-    """
     try:
         ticker = yf.Ticker(ticker_symbol)
         
@@ -34,7 +74,6 @@ def fetch_financial_data(ticker_symbol):
         if df_price.empty:
             return None, "No price data found for ticker."
         
-        # Ensure UTC tz-naive datetime index
         if df_price.index.tz is not None:
             df_price.index = df_price.index.tz_localize(None)
 
@@ -43,20 +82,16 @@ def fetch_financial_data(ticker_symbol):
         if sp500.index.tz is not None:
             sp500.index = sp500.index.tz_localize(None)
             
-        # Merge S&P 500 Close into Price DataFrame
         df_price = df_price.join(sp500['Close'].rename('SP500_Close'), how='left')
         df_price['SP500_Close'] = df_price['SP500_Close'].ffill().bfill()
         
-        # 2. Financial Statements (Quarterly & Annual)
+        # 2. Financial Statements
         q_financials = ticker.quarterly_financials
         q_income = ticker.quarterly_incomestmt
         a_financials = ticker.financials
         a_balance = ticker.balance_sheet
 
-        # Merge available income data
         q_combined = q_financials if not q_financials.empty else q_income
-        
-        # 3. Metadata & Key Ratios
         info = ticker.info if ticker.info else {}
 
         return {
@@ -74,14 +109,19 @@ def fetch_financial_data(ticker_symbol):
 # ANALYTICS & CAN SLIM HEURISTICS ENGINE
 # ==========================================
 def calculate_technicals(df):
-    """Calculates 10-week (50-day) and 40-week (200-day) SMAs, volume surges, and relative strength."""
     df = df.copy()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()   # ~10-Week SMA
     df['SMA_200'] = df['Close'].rolling(window=200).mean() # ~40-Week SMA
     
-    # Volume Spikes (40-50%+ above 50-day average volume)
+    # Volume Analysis
     df['Vol_SMA_50'] = df['Volume'].rolling(window=50).mean()
     df['Volume_Surge'] = (df['Volume'] >= 1.45 * df['Vol_SMA_50'])
+    
+    # Directional Buying vs Selling Volume Pressure
+    # Price close higher than previous close = Buying Volume (Green)
+    # Price close lower than previous close = Selling Volume (Red)
+    df['Price_Change'] = df['Close'] - df['Close'].shift(1)
+    df['Volume_Color'] = np.where(df['Price_Change'] >= 0, '#089981', '#f23645')
     
     # Relative Performance vs S&P 500 (Indexed at 100)
     stock_perf = df['Close'] / df['Close'].iloc[0]
@@ -90,12 +130,33 @@ def calculate_technicals(df):
     
     return df
 
+def calculate_accurate_roe(info, a_financials, a_balance):
+    """Calculates ROE accurately using financial statements if yfinance info is unreliable."""
+    # Attempt yfinance info value first
+    info_roe = info.get('returnOnEquity')
+    if info_roe is not None and not np.isnan(info_roe) and info_roe != 0:
+        return info_roe * 100
+
+    # Explicit Fallback: Net Income / Stockholder Equity
+    try:
+        if not a_financials.empty and not a_balance.empty:
+            net_income_col = [c for c in a_financials.index if 'Net Income' in str(c)]
+            equity_col = [c for c in a_balance.index if 'Stockholders Equity' in str(c) or 'Total Equity' in str(c)]
+            
+            if net_income_col and equity_col:
+                net_income = a_financials.loc[net_income_col[0]].iloc[0]
+                equity = a_balance.loc[equity_col[0]].iloc[0]
+                if equity != 0:
+                    return (net_income / equity) * 100
+    except Exception:
+        pass
+        
+    return None
+
 def process_quarterly_fundamentals(q_df):
-    """Processes quarterly EPS and Revenue to compute YoY Growth and Acceleration."""
     if q_df is None or q_df.empty:
         return pd.DataFrame()
     
-    # Extract Net Income & Total Revenue
     df = q_df.T.copy()
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
@@ -122,7 +183,6 @@ def process_quarterly_fundamentals(q_df):
         summary['Revenue'] = np.nan
         summary['Revenue_YoY_Growth_%'] = np.nan
 
-    # Acceleration Flag (YoY Growth greater than prior quarter's YoY Growth)
     summary['EPS_Accelerating'] = summary['EPS_YoY_Growth_%'] > summary['EPS_YoY_Growth_%'].shift(1)
     summary['Deceleration_Streak'] = (
         (summary['EPS_YoY_Growth_%'] < summary['EPS_YoY_Growth_%'].shift(1)) & 
@@ -132,7 +192,6 @@ def process_quarterly_fundamentals(q_df):
     return summary.sort_index(ascending=False)
 
 def detect_chart_patterns(df):
-    """Algorithmic heuristic for detecting consolidation, breakout, and Cup with Handle bases."""
     if len(df) < 200:
         return {"Pattern": "Insufficient Data", "Confidence": "Low", "Breakout": False}
     
@@ -140,7 +199,6 @@ def detect_chart_patterns(df):
     highs = recent_df['High'].values
     lows = recent_df['Low'].values
     
-    # Identify Prominent Peaks & Troughs
     peaks, _ = find_peaks(highs, distance=20)
     troughs, _ = find_peaks(-lows, distance=20)
     
@@ -152,12 +210,10 @@ def detect_chart_patterns(df):
         bottom = lows[troughs[0]]
         right_rim = highs[peaks[-1]]
         
-        # Cup Depth Criteria (12% to 35% depth)
         depth = (left_rim - bottom) / left_rim
         if 0.12 <= depth <= 0.40 and abs(left_rim - right_rim) / left_rim <= 0.15:
             pattern_detected = "Cup with Handle Pattern"
             
-    # Check Breakout near 52-Week High with Volume Surge
     max_52w = df['High'].tail(252).max()
     latest_close = df['Close'].iloc[-1]
     latest_vol_surge = df['Volume_Surge'].iloc[-1]
@@ -179,7 +235,6 @@ def detect_chart_patterns(df):
 st.title("📈 CAN SLIM Equity Analytics Dashboard")
 st.caption("Quantitative screening based on William O'Neil's *How to Make Money in Stocks* principles.")
 
-# Sidebar Configuration
 st.sidebar.header("User Settings")
 ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
 st.sidebar.markdown("---")
@@ -199,23 +254,68 @@ if ticker_input:
     if err or data is None:
         st.error(f"Error fetching data for '{ticker_input}': {err}")
     else:
-        # Unpack Data
         df_price = calculate_technicals(data['price_data'])
         q_summary = process_quarterly_fundamentals(data['q_financials'])
         pattern_info = detect_chart_patterns(df_price)
         info = data['info']
 
-        # Metric Overview Top Panel
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # Price Calculations
         latest_price = df_price['Close'].iloc[-1]
         prev_price = df_price['Close'].iloc[-2]
         chg = ((latest_price - prev_price) / prev_price) * 100
+        chg_class = "text-green" if chg >= 0 else "text-red"
         
-        col1.metric("Current Price", f"${latest_price:,.2f}", f"{chg:+.2f}%")
-        col2.metric("52-Week Range", f"${df_price['Low'].tail(252).min():,.2f} - ${df_price['High'].tail(252).max():,.2f}")
-        col3.metric("Market Cap", f"${info.get('marketCap', 0):,}" if info.get('marketCap') else "N/A")
-        col4.metric("ROE", f"{info.get('returnOnEquity', 0)*100:.2f}%" if info.get('returnOnEquity') else "N/A")
-        col5.metric("Base Pattern Detected", pattern_info['Pattern'])
+        # Accurate ROE Calculation
+        calculated_roe = calculate_accurate_roe(info, data['a_financials'], data['a_balance'])
+        roe_display = f"{calculated_roe:.2f}%" if calculated_roe is not None else "N/A"
+
+        # 52-Week Range
+        min_52w = df_price['Low'].tail(252).min()
+        max_52w = df_price['High'].tail(252).max()
+
+        # Non-Truncating HTML Cards
+        c1, c2, c3, c4, c5 = st.columns(5)
+        
+        with c1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-title">Current Price</div>
+                <div class="metric-value">${latest_price:,.2f}</div>
+                <div class="metric-sub {chg_class}">{chg:+.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-title">52-Week Range</div>
+                <div class="metric-value" style="font-size: 16px;">${min_52w:,.2f} - ${max_52w:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-title">Market Cap</div>
+                <div class="metric-value">{format_large_number(info.get('marketCap'))}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-title">ROE</div>
+                <div class="metric-value">{roe_display}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c5:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-title">Base Pattern Detected</div>
+                <div class="metric-value" style="font-size: 16px;">{pattern_info['Pattern']}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         # Multi-Tab Layout
         tab_tech, tab_fund, tab_pattern, tab_catalyst = st.tabs([
@@ -231,58 +331,73 @@ if ticker_input:
         with tab_tech:
             st.subheader("Price History, Moving Averages & Volume Demand Spikes")
             
-            # Date Range Selector
-            chart_range = st.radio("Chart Timeframe", ["1 Year", "5 Years", "Max History"], index=2, horizontal=True)
+            chart_range = st.radio("Chart Timeframe Filter", ["1 Year", "5 Years", "Max History"], index=0, horizontal=True)
+            
             if chart_range == "1 Year":
                 plot_df = df_price.tail(252)
+                initial_visible_days = 126  # Default view ~6 months to avoid candle clutter
             elif chart_range == "5 Years":
                 plot_df = df_price.tail(252 * 5)
+                initial_visible_days = 252
             else:
                 plot_df = df_price
+                initial_visible_days = 504
 
             # Interactive Plotly Subplots
             fig = make_subplots(
                 rows=3, cols=1, 
                 shared_xaxes=True, 
-                vertical_spacing=0.03, 
-                subplot_titles=(f"{ticker_input} Price & Moving Averages", "Daily Trading Volume", "Relative Strength vs S&P 500"),
-                row_heights=[0.5, 0.25, 0.25]
+                vertical_spacing=0.04, 
+                subplot_titles=(f"{ticker_input} Candlestick Price & Moving Averages", "Volume (Green = Buying Pressure / Red = Selling Pressure)", "Relative Strength Line vs S&P 500"),
+                row_heights=[0.55, 0.22, 0.23]
             )
 
-            # Row 1: Candlesticks & SMAs
+            # Row 1: Uncluttered Candlesticks & SMAs
             fig.add_trace(go.Candlestick(
                 x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                low=plot_df['Low'], close=plot_df['Close'], name="Price"
+                low=plot_df['Low'], close=plot_df['Close'], name="Price",
+                increasing_line_color='#089981', decreasing_line_color='#f23645'
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
                 x=plot_df.index, y=plot_df['SMA_50'], name="10-Week SMA (50-Day)",
-                line=dict(color='blue', width=1.5)
+                line=dict(color='#2962ff', width=1.5)
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
                 x=plot_df.index, y=plot_df['SMA_200'], name="40-Week SMA (200-Day)",
-                line=dict(color='red', width=1.5)
+                line=dict(color='#ff6d00', width=1.5)
             ), row=1, col=1)
 
-            # Row 2: Volume Spikes
-            colors = ['green' if surge else 'gray' for surge in plot_df['Volume_Surge']]
+            # Row 2: Directional Buying vs Selling Volume
             fig.add_trace(go.Bar(
-                x=plot_df.index, y=plot_df['Volume'], name="Volume", marker_color=colors
+                x=plot_df.index, y=plot_df['Volume'], name="Volume Pressure",
+                marker_color=plot_df['Volume_Color'], opacity=0.8
             ), row=2, col=1)
             
             fig.add_trace(go.Scatter(
                 x=plot_df.index, y=plot_df['Vol_SMA_50'], name="50-Day Vol Avg",
-                line=dict(color='orange', width=1)
+                line=dict(color='#f7a900', width=1.5)
             ), row=2, col=1)
 
             # Row 3: RS Line vs S&P 500
             fig.add_trace(go.Scatter(
                 x=plot_df.index, y=plot_df['RS_Line'], name="RS Line vs S&P 500",
-                line=dict(color='purple', width=2)
+                line=dict(color='#9c27b0', width=2)
             ), row=3, col=1)
 
-            fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
+            # Initial Visible Window (Prevents Candle Clustering)
+            start_date = plot_df.index[-min(initial_visible_days, len(plot_df))]
+            end_date = plot_df.index[-1]
+
+            fig.update_layout(
+                height=850,
+                xaxis_rangeslider_visible=False,
+                template="plotly_dark",
+                margin=dict(l=20, r=20, t=40, b=20),
+                xaxis=dict(range=[start_date, end_date])
+            )
+
             st.plotly_chart(fig, use_container_width=True)
 
         # -------------------------------------------------------------
@@ -295,18 +410,17 @@ if ticker_input:
                 col_f1, col_f2 = st.columns([2, 1])
                 
                 with col_f1:
-                    # Quarterly Plot
                     fig_fund = make_subplots(specs=[[{"secondary_y": True}]])
                     fig_fund.add_trace(go.Bar(
-                        x=q_summary.index, y=q_summary['EPS'], name="Quarterly EPS", marker_color='darkblue'
+                        x=q_summary.index, y=q_summary['EPS'], name="Quarterly EPS", marker_color='#2962ff'
                     ), secondary_y=False)
                     
                     fig_fund.add_trace(go.Scatter(
                         x=q_summary.index, y=q_summary['EPS_YoY_Growth_%'], name="EPS YoY Growth %",
-                        line=dict(color='darkgreen', width=3)
+                        line=dict(color='#089981', width=3)
                     ), secondary_y=True)
                     
-                    fig_fund.update_layout(title_text="Historical Quarterly EPS & YoY Growth Rate", template="plotly_white")
+                    fig_fund.update_layout(title_text="Historical Quarterly EPS & YoY Growth Rate", template="plotly_dark")
                     fig_fund.update_yaxes(title_text="EPS ($)", secondary_y=False)
                     fig_fund.update_yaxes(title_text="YoY Growth (%)", secondary_y=True)
                     st.plotly_chart(fig_fund, use_container_width=True)
@@ -321,7 +435,6 @@ if ticker_input:
                         else:
                             st.warning("Below CAN SLIM benchmark of 20%+ quarterly growth.")
                             
-                    # Deceleration Check
                     if len(q_summary) >= 3 and q_summary['Deceleration_Streak'].iloc[0]:
                         st.error("🚨 Warning: Two consecutive quarters of EPS deceleration detected (Sell Alert Criteria).")
                     else:
