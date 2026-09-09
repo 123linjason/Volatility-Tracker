@@ -300,8 +300,7 @@ def fetch_institutional_trends(ticker_symbol):
         "Total Shares Held": shares
     })
     df['QoQ Share Change (%)'] = df['Total Shares Held'].pct_change(-1) * 100
-    df['QoQ Share Change (%)'] = df['QoQ Share Change (%)'].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "N/A")
-    df['Total Shares Held'] = df['Total Shares Held'].apply(lambda x: f"{x:,.0f}")
+    df['QoQ Share Change (%)'] = df['Total Shares Held'].apply(lambda x: f"{x:,.0f}")
     return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -328,34 +327,54 @@ def calculate_technicals(df):
     sp_perf = df['SP500_Close'] / df['SP500_Close'].iloc[0]
     df['RS_Line'] = (stock_perf / sp_perf) * 100
     
+    df['Down_Day'] = df['Price_Change'] / df['Close'].shift(1) <= -0.002
+    df['Higher_Vol'] = df['Volume'] > df['Volume'].shift(1)
+    df['Distribution_Day'] = df['Down_Day'] & df['Higher_Vol']
+    
     return df
 
+# REVISED CHRONOLOGICAL FUNDAMENTAL PROCESSING
 def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     records = {}
 
+    # 1. Process Quarterly Financial Statements
     if q_df is not None and not q_df.empty:
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
+        df_t = df_t.sort_index(ascending=True) # Sort oldest to newest for pct_change
         
         rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
         eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
         
         for dt, row in df_t.iterrows():
-            q_key = date_to_quarter_str(dt)
+            q_key = f"{dt.strftime('%Y-%m-%d')} ({date_to_quarter_str(dt)})"
             records[q_key] = {
                 "Date": dt,
+                "Quarter_Label": date_to_quarter_str(dt),
                 "Quarterly Revenue ($)": pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan,
                 "Quarterly EPS ($)": pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
             }
 
+    # 2. Process Earnings Dates Callouts
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
+        ed_clean.index = pd.to_datetime(ed_clean.index)
+        ed_clean = ed_clean.sort_index(ascending=True)
+        
         for dt, row in ed_clean.iterrows():
-            q_key = date_to_quarter_str(dt)
+            # Skip future estimated earnings dates
+            if dt > pd.Timestamp.now():
+                continue
+            q_key = f"{dt.strftime('%Y-%m-%d')} ({date_to_quarter_str(dt)})"
             reported_eps = pd.to_numeric(row['Reported EPS'], errors='coerce')
             
             if q_key not in records:
-                records[q_key] = {"Date": dt, "Quarterly Revenue ($)": np.nan, "Quarterly EPS ($)": reported_eps}
+                records[q_key] = {
+                    "Date": dt,
+                    "Quarter_Label": date_to_quarter_str(dt),
+                    "Quarterly Revenue ($)": np.nan,
+                    "Quarterly EPS ($)": reported_eps
+                }
             elif np.isnan(records[q_key]["Quarterly EPS ($)"]):
                 records[q_key]["Quarterly EPS ($)"] = reported_eps
 
@@ -363,11 +382,10 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
         return pd.DataFrame(), "N/A"
 
     summary = pd.DataFrame.from_dict(records, orient='index')
-    summary['Date'] = pd.to_datetime(summary['Date'])
     summary = summary.sort_values('Date', ascending=True)
 
+    # YoY / QoQ Calculations done chronologically
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
-
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
 
@@ -377,51 +395,61 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
-    accel_quarters = summary[summary['Acceleration_Start']].index
-    latest_accel_q = accel_quarters[-1] if len(accel_quarters) > 0 else "N/A"
+    accel_quarters = summary[summary['Acceleration_Start']]['Quarter_Label']
+    latest_accel_q = accel_quarters.iloc[-1] if len(accel_quarters) > 0 else "N/A"
 
     summary['Status Indicator'] = np.where(
         summary['Acceleration_Start'], "🚀 Acceleration Started",
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    summary['Quarter_Label'] = summary.index
+    # Sort DESCENDING so most recent earnings are at top
+    summary_desc = summary.sort_values('Date', ascending=False).head(24)
 
-    return summary.sort_values('Date', ascending=False).tail(24), latest_accel_q
+    return summary_desc, latest_accel_q
 
 # ==========================================
-# REVISED DYNAMIC PATTERN DETECTION ALGORITHM
+# 6. ENHANCED PATTERN & SELL DETECTION ENGINE
 # ==========================================
-def detect_chart_patterns(df):
+def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     if df is None or len(df) < 60:
-        return {"Pattern": "Insufficient Data", "Near_52W_High": False, "Volume_Surge": False}
+        return {
+            "Pattern": "Insufficient Data",
+            "Near_52W_High": False,
+            "Volume_Surge": False,
+            "Sell_Signals": [],
+            "Is_Downtrend": False
+        }
 
     close = df['Close']
     high = df['High']
     low = df['Low']
+    sma50 = df['SMA_50']
+    sma200 = df['SMA_200']
 
-    # Evaluate 1-Year (252 bars) metrics
+    curr_price = close.iloc[-1]
+    curr_sma50 = sma50.iloc[-1]
+    curr_sma200 = sma200.iloc[-1]
+
     window = min(len(df), 252)
     h_252 = high.tail(window)
     l_252 = low.tail(window)
     
     max_52w = h_252.max()
     min_52w = l_252.min()
-    curr_price = close.iloc[-1]
 
     off_high_pct = (max_52w - curr_price) / max_52w * 100
     base_depth_pct = (max_52w - min_52w) / max_52w * 100
 
-    # Inspect last 65 bars (~13 weeks) for Handle or Pivot structures
-    recent_65_high = high.tail(65).max()
-    recent_65_low = low.tail(65).min()
+    below_50d = curr_price < curr_sma50
+    below_200d = curr_price < curr_sma200
     
-    # Inspect last 15 bars (~3 weeks) for tight handle/pullback
+    ret_50d = (curr_price - close.iloc[-50]) / close.iloc[-50] * 100 if len(close) >= 50 else 0
+
     recent_15_high = high.tail(15).max()
     recent_15_low = low.tail(15).min()
     handle_depth = (recent_15_high - recent_15_low) / recent_15_high * 100
 
-    # Identify Double-Trough structure (W-Bottom) across two 30-bar windows
     tail_60_low = low.tail(60)
     trough1 = tail_60_low.iloc[:30].min()
     trough2 = tail_60_low.iloc[30:].min()
@@ -430,41 +458,54 @@ def detect_chart_patterns(df):
     trough_diff_pct = abs(trough1 - trough2) / max(trough1, 1e-5) * 100
     bounce_height_pct = (mid_bounce - min(trough1, trough2)) / max(min(trough1, trough2), 1e-5) * 100
 
-    # -------------------------------------------------------------
-    # CAN SLIM PATTERN CLASSIFICATION ENGINE
-    # -------------------------------------------------------------
-    # 1. Double Bottom / W-Bottom Rules
-    if trough_diff_pct <= 6.0 and bounce_height_pct >= 8.0 and off_high_pct <= 25:
+    sell_signals = []
+
+    if user_cost_basis and user_cost_basis > 0:
+        loss_pct = (curr_price - user_cost_basis) / user_cost_basis * 100
+        if loss_pct <= -7.0:
+            sell_signals.append(f"🛑 **HARD STOP LOSS HIT:** Stock is down **{loss_pct:.2f}%** from cost basis (7-8% limit exceeded).")
+
+    if below_200d:
+        sell_signals.append("📉 **200-DAY MOVING AVERAGE BREAKDOWN:** Price has fallen below the 200-day SMA (major institutional exit).")
+    elif below_50d and df['Volume_Surge'].iloc[-1]:
+        sell_signals.append("⚠️ **50-DAY SMA BREAKDOWN ON HEAVY VOLUME:** Heavy institutional distribution below the 10-week/50-day line.")
+
+    dist_days_count = df['Distribution_Day'].tail(25).sum() if 'Distribution_Day' in df.columns else 0
+    if dist_days_count >= 5:
+        sell_signals.append(f"🚨 **HEAVY DISTRIBUTION:** {dist_days_count} distribution days logged in the past 25 sessions.")
+
+    is_downtrend = False
+
+    if off_high_pct > 25.0 and (below_50d or ret_50d < -10.0):
+        pattern = "Downtrend / Severe Correction"
+        is_downtrend = True
+    elif below_50d and below_200d:
+        pattern = "Downtrend / Below Key MAs"
+        is_downtrend = True
+    elif trough_diff_pct <= 6.0 and bounce_height_pct >= 8.0 and off_high_pct <= 25 and not below_50d:
         pattern = "W Bottom / Double Bottom"
-
-    # 2. Cup with Handle Rules (Depth 12% to 45%, handle depth < 15%, within 20% of 52W High)
-    elif 12.0 <= base_depth_pct <= 45.0 and off_high_pct <= 20.0 and handle_depth <= 15.0:
+    elif 12.0 <= base_depth_pct <= 45.0 and off_high_pct <= 20.0 and handle_depth <= 15.0 and not below_50d:
         pattern = "Cup with Handle"
-
-    # 3. Cup Base (Rounding bottom without handle yet)
-    elif 15.0 <= base_depth_pct <= 42.0 and off_high_pct <= 25.0:
+    elif 15.0 <= base_depth_pct <= 42.0 and off_high_pct <= 25.0 and not below_200d:
         pattern = "Cup Base"
-
-    # 4. Flat Base (Tight sideways range <= 15% range over 5+ weeks)
-    elif base_depth_pct <= 16.0 and off_high_pct <= 15.0:
+    elif base_depth_pct <= 16.0 and off_high_pct <= 15.0 and not below_50d:
         pattern = "Flat Base"
-
-    # 5. Ascending Base / Near Highs Consolidation
-    elif off_high_pct <= 9.0:
+    elif off_high_pct <= 9.0 and not below_50d:
         pattern = "Ascending Base / Near Highs"
-
-    # 6. Fallback General Consolidation
     else:
         pattern = "Consolidation Base"
 
     return {
         "Pattern": pattern,
         "Near_52W_High": curr_price >= 0.90 * max_52w,
-        "Volume_Surge": bool(df['Volume_Surge'].iloc[-1]) if 'Volume_Surge' in df.columns else False
+        "Volume_Surge": bool(df['Volume_Surge'].iloc[-1]) if 'Volume_Surge' in df.columns else False,
+        "Sell_Signals": sell_signals,
+        "Is_Downtrend": is_downtrend,
+        "Dist_Days_Count": dist_days_count
     }
 
 # ==========================================
-# 6. TECHNICAL CHART FRAGMENT
+# 7. TECHNICAL CHART FRAGMENT
 # ==========================================
 @st.fragment
 def render_technical_chart(df_price):
@@ -492,7 +533,7 @@ def render_technical_chart(df_price):
     st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
-# 7. MAIN APPLICATION LAYOUT & DASHBOARD
+# 8. MAIN APPLICATION LAYOUT & DASHBOARD
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
@@ -543,13 +584,22 @@ with st.sidebar:
         "Auto-Populated Peer Group",
         key="peers_input_box"
     )
-    st.caption("Peer tickers auto-populate based on sector relationships and recommendation endpoints.")
+    
+    st.markdown("---")
+    st.subheader("🎯 Position & Sell Diagnostics")
+    user_cost_basis = st.number_input(
+        "Your Average Purchase Price ($)",
+        min_value=0.0,
+        value=0.0,
+        step=1.0,
+        help="Enter your purchase cost basis to run automated CAN SLIM 7-8% stop loss and sell discipline checks."
+    )
 
 ticker_input = st.session_state["selected_ticker"]
 peer_input = st.session_state["peers_input_box"].upper()
 
 if ticker_input:
-    with st.spinner(f"Retrieving 24-quarter analytics for {ticker_input}..."):
+    with st.spinner(f"Retrieving analytics for {ticker_input}..."):
         data, err = fetch_financial_data(ticker_input)
 
     if err or data is None:
@@ -558,7 +608,7 @@ if ticker_input:
         df_price = calculate_technicals(data['price_data'])
         info = data['info']
         q_summary, accel_start_q = process_quarterly_fundamentals_24q(data['q_financials'], data['earnings_dates'], info)
-        pattern_info = detect_chart_patterns(df_price)
+        pattern_info = detect_chart_patterns_and_sell_signals(df_price, user_cost_basis)
 
         # -------------------------------------------------------------
         # TOP FINANCIAL HEADER METRICS
@@ -586,12 +636,21 @@ if ticker_input:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 14px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
         # -------------------------------------------------------------
-        # AUTOMATED BUY SIGNAL BANNER
+        # AUTOMATED BUY / SELL / HOLD SIGNAL BANNERS
         # -------------------------------------------------------------
         pattern_name = pattern_info["Pattern"]
-        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom", "Flat Base", "Ascending Base / Near Highs"]
+        sell_signals = pattern_info["Sell_Signals"]
+        is_downtrend = pattern_info["Is_Downtrend"]
+        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom", "Flat Base", "Ascending Base / Near Highs"] and len(sell_signals) == 0
 
-        if is_buy_candidate:
+        if len(sell_signals) > 0 or is_downtrend:
+            st.error(f"🔴 **SELL / AVOID SIGNAL:** **{ticker_input}** is exhibiting technical breakdown traits or major sell signals.")
+            with st.expander("🔻 View Active CAN SLIM Sell Catalyst Details", expanded=True):
+                for sig in sell_signals:
+                    st.markdown(f"- {sig}")
+                if is_downtrend:
+                    st.markdown(f"- 📉 **Structure in Downside Channel:** Categorized as **{pattern_name}** (>25% off 52W high / trading below key moving averages).")
+        elif is_buy_candidate:
             st.success(f"🟢 **BUY RECOMMENDATION:** **{ticker_input}** is breaking out or forming an actionable **{pattern_name}** base structure.")
         else:
             st.info(f"⚪ **HOLD / PASS:** **{ticker_input}** is currently in a **{pattern_name}** pattern. Wait for a Cup with Handle or W Bottom setup before opening a position.")
@@ -640,10 +699,10 @@ if ticker_input:
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
-                st.caption("Displays Quarterly Sales, YoY Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
+                st.caption("Displays Quarterly Sales, YoY Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted chronologically (Most Recent at Top).")
                 
                 display_df = q_summary.copy()
-                display_df.index = display_df['Quarter_Label']
+                display_df['Quarter / Date'] = display_df.index
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
                 display_df['YoY Sales Growth'] = display_df['YoY Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
@@ -654,11 +713,11 @@ if ticker_input:
                 display_df['Annual EPS (TTM)'] = display_df['Annual EPS (TTM)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
 
                 cols_to_show = [
-                    'Quarterly Revenue', 'YoY Sales Growth',
+                    'Quarter / Date', 'Quarterly Revenue', 'YoY Sales Growth',
                     'Quarterly EPS', 'QoQ EPS Growth', 'YoY EPS Growth',
                     'Annual Sales (TTM)', 'Annual EPS (TTM)', 'Status Indicator'
                 ]
-                st.dataframe(display_df[cols_to_show], use_container_width=True)
+                st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
 
             st.markdown("---")
             st.markdown("### 🔍 Quarter-by-Quarter One-Time Expenses & Non-GAAP Reconciliations")
