@@ -180,9 +180,6 @@ def format_pct(num):
     return f"{num:+.2f}%"
 
 def get_fiscal_quarter_label(dt, is_nvda=False):
-    """
-    Handles fiscal year offsets (e.g., NVDA fiscal year ends in January).
-    """
     if isinstance(dt, str):
         dt = pd.to_datetime(dt)
         
@@ -190,18 +187,16 @@ def get_fiscal_quarter_label(dt, is_nvda=False):
     month = dt.month
 
     if is_nvda:
-        # NVDA Fiscal Calendar: Q1 (Feb-Apr), Q2 (May-Jul), Q3 (Aug-Oct), Q4 (Nov-Jan)
         if month in [2, 3, 4]:
             return f"Q1 FY{year + 1}"
         elif month in [5, 6, 7]:
             return f"Q2 FY{year + 1}"
         elif month in [8, 9, 10]:
             return f"Q3 FY{year + 1}"
-        else: # 11, 12, 1
+        else:
             fy = year + 1 if month in [11, 12] else year
             return f"Q4 FY{fy}"
     else:
-        # Standard Calendar Quarter
         quarter = (month - 1) // 3 + 1
         return f"Q{quarter} {year}"
 
@@ -213,7 +208,6 @@ def fetch_financial_data(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
         
-        # Historical Price Data
         df_price = ticker.history(period="max", interval="1d")
         if df_price.empty:
             return None, f"No price history found for ticker '{ticker_symbol}'."
@@ -221,7 +215,6 @@ def fetch_financial_data(ticker_symbol):
         if df_price.index.tz is not None:
             df_price.index = df_price.index.tz_localize(None)
 
-        # S&P 500 Benchmark Comparison
         sp500 = yf.Ticker("^GSPC").history(period="max", interval="1d")
         if not sp500.empty and sp500.index.tz is not None:
             sp500.index = sp500.index.tz_localize(None)
@@ -229,12 +222,10 @@ def fetch_financial_data(ticker_symbol):
         df_price = df_price.join(sp500['Close'].rename('SP500_Close'), how='left')
         df_price['SP500_Close'] = df_price['SP500_Close'].ffill().bfill()
         
-        # Financial Statements
         q_financials = ticker.quarterly_financials
         q_income = ticker.quarterly_incomestmt
         q_combined = q_financials if not q_financials.empty else q_income
         
-        # Extended Earnings Dates (pull up to 32 past/future quarters)
         earnings_dates = pd.DataFrame()
         try:
             ed = ticker.get_earnings_dates(limit=40)
@@ -412,8 +403,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
-    # Calculate YoY & QoQ Growth Across full multi-year history
-    summary['YoY Revenue Growth (%)'] = summary['Revenue'].pct_change(4) * 100
+    # Calculate EPS Growth Across full multi-year history
     summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
 
@@ -751,16 +741,15 @@ if ticker_input:
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED)
+        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED - REVENUE YOY REMOVED)
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
-                st.caption("Displays Quarterly Sales, YoY Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted chronologically (Most Recent at Top).")
+                st.caption("Displays Quarterly Sales, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted chronologically (Most Recent at Top).")
                 
                 display_df = q_summary.copy()
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
-                display_df['YoY Sales Growth'] = display_df['YoY Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['Quarterly EPS'] = display_df['Quarterly EPS ($)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
                 display_df['QoQ EPS Growth'] = display_df['QoQ EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['YoY EPS Growth'] = display_df['YoY EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
@@ -768,7 +757,7 @@ if ticker_input:
                 display_df['Annual EPS (TTM)'] = display_df['Annual EPS (TTM)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
 
                 cols_to_show = [
-                    'Quarter / Date', 'Quarterly Revenue', 'YoY Sales Growth',
+                    'Quarter / Date', 'Quarterly Revenue',
                     'Quarterly EPS', 'QoQ EPS Growth', 'YoY EPS Growth',
                     'Annual Sales (TTM)', 'Annual EPS (TTM)', 'Status Indicator'
                 ]
