@@ -64,8 +64,7 @@ def fetch_financial_data(ticker_symbol):
             "q_financials": q_combined,
             "a_financials": a_financials,
             "a_balance": a_balance,
-            "info": info,
-            "ticker_obj": ticker
+            "info": info
         }, None
         
     except Exception as e:
