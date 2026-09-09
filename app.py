@@ -365,7 +365,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     summary['Date'] = pd.to_datetime(summary['Date'])
     summary = summary.sort_values('Date', ascending=True)
 
-    summary['QoQ Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(1) * 100
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
 
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
@@ -543,6 +542,17 @@ if ticker_input:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 15px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
         # -------------------------------------------------------------
+        # AUTOMATED BUY SIGNAL BANNER
+        # -------------------------------------------------------------
+        pattern_name = pattern_info["Pattern"]
+        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom"]
+
+        if is_buy_candidate:
+            st.success(f"🟢 **BUY RECOMMENDATION:** **{ticker_input}** is breaking out or forming an actionable **{pattern_name}** base structure.")
+        else:
+            st.info(f"⚪ **HOLD / PASS:** **{ticker_input}** is currently in a **{pattern_name}** pattern. Wait for a Cup with Handle or W Bottom setup before opening a position.")
+
+        # -------------------------------------------------------------
         # CAN SLIM SCORECARD BANNER
         # -------------------------------------------------------------
         st.markdown("### 🏆 CAN SLIM Quantitative Scorecard")
@@ -586,13 +596,12 @@ if ticker_input:
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
-                st.caption("Displays Quarterly Sales, YoY/QoQ Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
+                st.caption("Displays Quarterly Sales, YoY Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
                 
                 display_df = q_summary.copy()
                 display_df.index = display_df['Quarter_Label']
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
-                display_df['QoQ Sales Growth'] = display_df['QoQ Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['YoY Sales Growth'] = display_df['YoY Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['Quarterly EPS'] = display_df['Quarterly EPS ($)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
                 display_df['QoQ EPS Growth'] = display_df['QoQ EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
@@ -601,7 +610,7 @@ if ticker_input:
                 display_df['Annual EPS (TTM)'] = display_df['Annual EPS (TTM)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
 
                 cols_to_show = [
-                    'Quarterly Revenue', 'QoQ Sales Growth', 'YoY Sales Growth',
+                    'Quarterly Revenue', 'YoY Sales Growth',
                     'Quarterly EPS', 'QoQ EPS Growth', 'YoY EPS Growth',
                     'Annual Sales (TTM)', 'Annual EPS (TTM)', 'Status Indicator'
                 ]
