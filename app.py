@@ -161,7 +161,7 @@ def get_watchlist_peers_string(ticker_symbol):
     return fetch_online_peers(ticker_symbol)
 
 # ==========================================
-# 3. HELPER UTILITIES
+# 3. HELPER UTILITIES & FISCAL MAPPINGS
 # ==========================================
 def format_large_number(num):
     if num is None or np.isnan(num):
@@ -179,11 +179,31 @@ def format_pct(num):
         return "N/A"
     return f"{num:+.2f}%"
 
-def date_to_quarter_str(dt):
+def get_fiscal_quarter_label(dt, is_nvda=False):
+    """
+    Handles fiscal year offsets (e.g., NVDA fiscal year ends in January).
+    """
     if isinstance(dt, str):
         dt = pd.to_datetime(dt)
-    quarter = (dt.month - 1) // 3 + 1
-    return f"Q{quarter} {dt.year}"
+        
+    year = dt.year
+    month = dt.month
+
+    if is_nvda:
+        # NVDA Fiscal Calendar: Q1 (Feb-Apr), Q2 (May-Jul), Q3 (Aug-Oct), Q4 (Nov-Jan)
+        if month in [2, 3, 4]:
+            return f"Q1 FY{year + 1}"
+        elif month in [5, 6, 7]:
+            return f"Q2 FY{year + 1}"
+        elif month in [8, 9, 10]:
+            return f"Q3 FY{year + 1}"
+        else: # 11, 12, 1
+            fy = year + 1 if month in [11, 12] else year
+            return f"Q4 FY{fy}"
+    else:
+        # Standard Calendar Quarter
+        quarter = (month - 1) // 3 + 1
+        return f"Q{quarter} {year}"
 
 # ==========================================
 # 4. CACHED DATA FETCHING ENGINE
@@ -306,8 +326,8 @@ def fetch_institutional_trends(ticker_symbol):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_one_time_expenses(ticker_symbol):
     return pd.DataFrame([
-        {"Quarter": "Q2 2026", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Stock-Based Compensation & Intangible Amortization Charges."},
-        {"Quarter": "Q1 2026", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Restructuring expenses, litigation provisions, and tax adjustments."}
+        {"Quarter": "Q2 FY2027", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Stock-Based Compensation & Intangible Amortization Charges."},
+        {"Quarter": "Q1 FY2027", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Restructuring expenses, litigation provisions, and tax adjustments."}
     ])
 
 # ==========================================
@@ -333,62 +353,63 @@ def calculate_technicals(df):
     
     return df
 
-def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
-    records = {}
+def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol=""):
+    is_nvda = (ticker_symbol.upper() == "NVDA")
+    
+    if q_df is None or q_df.empty:
+        return pd.DataFrame(), "N/A"
 
-    # 1. Process Quarterly Financial Statements
-    if q_df is not None and not q_df.empty:
-        df_t = q_df.T.copy()
-        df_t.index = pd.to_datetime(df_t.index)
-        df_t = df_t.sort_index(ascending=True) # Ascending for correct pct_change
-        
-        rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
-        eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
-        
-        for dt, row in df_t.iterrows():
-            q_key = f"{dt.strftime('%Y-%m-%d')} ({date_to_quarter_str(dt)})"
-            records[q_key] = {
-                "Date": dt,
-                "Quarter_Label": date_to_quarter_str(dt),
-                "Quarterly Revenue ($)": pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan,
-                "Quarterly EPS ($)": pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
-            }
+    df_t = q_df.T.copy()
+    df_t.index = pd.to_datetime(df_t.index)
+    df_t = df_t.sort_index(ascending=True) # Ascending order for correct growth metrics
 
-    # 2. Process Earnings Dates Callouts
+    rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
+    eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
+
+    records = []
+
+    # Filter earnings dates
+    ed_clean = pd.DataFrame()
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
         ed_clean.index = pd.to_datetime(ed_clean.index)
-        ed_clean = ed_clean.sort_index(ascending=True)
-        
-        for dt, row in ed_clean.iterrows():
-            if dt > pd.Timestamp.now():
-                continue
-            q_key = f"{dt.strftime('%Y-%m-%d')} ({date_to_quarter_str(dt)})"
-            reported_eps = pd.to_numeric(row['Reported EPS'], errors='coerce')
-            
-            if q_key not in records:
-                records[q_key] = {
-                    "Date": dt,
-                    "Quarter_Label": date_to_quarter_str(dt),
-                    "Quarterly Revenue ($)": np.nan,
-                    "Quarterly EPS ($)": reported_eps
-                }
-            elif np.isnan(records[q_key]["Quarterly EPS ($)"]):
-                records[q_key]["Quarterly EPS ($)"] = reported_eps
 
-    if not records:
+    for dt, row in df_t.iterrows():
+        q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
+        
+        revenue = pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan
+        eps = pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
+
+        # Match with closest earnings report date if EPS missing
+        if np.isnan(eps) and not ed_clean.empty:
+            close_dates = ed_clean[abs(ed_clean.index - dt) <= pd.Timedelta(days=45)]
+            if not close_dates.empty:
+                eps = pd.to_numeric(close_dates['Reported EPS'].iloc[0], errors='coerce')
+
+        records.append({
+            "Date": dt,
+            "Quarter_Label": q_label,
+            "Quarter / Date": f"{dt.strftime('%Y-%m-%d')} ({q_label})",
+            "Quarterly Revenue ($)": revenue,
+            "Quarterly EPS ($)": eps
+        })
+
+    summary = pd.DataFrame(records)
+    if summary.empty:
         return pd.DataFrame(), "N/A"
 
-    summary = pd.DataFrame.from_dict(records, orient='index')
-    summary = summary.sort_values('Date', ascending=True)
+    summary = summary.sort_values('Date', ascending=True).reset_index(drop=True)
 
+    # Calculate Growth Rates (YoY = 4 periods back, QoQ = 1 period back)
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
 
+    # Calculate Trailing Twelve Months (TTM)
     summary['Annual Sales (TTM)'] = summary['Quarterly Revenue ($)'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['Quarterly EPS ($)'].rolling(window=4, min_periods=1).sum()
 
+    # Acceleration Triggers
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -400,7 +421,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    # Sort DESCENDING so most recent quarters are at top
+    # Sort DESCENDING (Most recent quarter at top)
     summary_desc = summary.sort_values('Date', ascending=False).head(24)
 
     return summary_desc, latest_accel_q
@@ -459,7 +480,7 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     hard_sell_signals = []
     caution_warnings = []
 
-    # 1. HARD SELL RULES (Strict CAN SLIM Cut-Off Rules)
+    # 1. HARD SELL RULES
     if user_cost_basis and user_cost_basis > 0:
         loss_pct = (curr_price - user_cost_basis) / user_cost_basis * 100
         if loss_pct <= -7.0:
@@ -470,7 +491,7 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     elif below_50d and df['Volume_Surge'].iloc[-1]:
         hard_sell_signals.append("⚠️ **50-DAY SMA BREAKDOWN ON HEAVY VOLUME:** Heavy institutional distribution below the 10-week/50-day line.")
 
-    # 2. CAUTION WARNINGS (Non-fatal unless combined with technical breakdowns)
+    # 2. CAUTION WARNINGS
     dist_days_count = df['Distribution_Day'].tail(25).sum() if 'Distribution_Day' in df.columns else 0
     if dist_days_count >= 5:
         caution_warnings.append(f"⚠️ **ELEVATED DISTRIBUTION:** {dist_days_count} distribution days logged in past 25 sessions. Monitor 50-day SMA support.")
@@ -540,7 +561,6 @@ def render_technical_chart(df_price):
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
-# State Initialization
 if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "NVDA"
 if "peers_input_box" not in st.session_state:
@@ -610,7 +630,12 @@ if ticker_input:
     else:
         df_price = calculate_technicals(data['price_data'])
         info = data['info']
-        q_summary, accel_start_q = process_quarterly_fundamentals_24q(data['q_financials'], data['earnings_dates'], info)
+        q_summary, accel_start_q = process_quarterly_fundamentals_24q(
+            data['q_financials'], 
+            data['earnings_dates'], 
+            info, 
+            ticker_input
+        )
         pattern_info = detect_chart_patterns_and_sell_signals(df_price, user_cost_basis)
 
         # -------------------------------------------------------------
@@ -639,7 +664,7 @@ if ticker_input:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 14px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
         # -------------------------------------------------------------
-        # REVISED AUTOMATED BUY / WATCH / SELL SIGNAL BANNERS
+        # AUTOMATED BUY / WATCH / SELL SIGNAL BANNERS
         # -------------------------------------------------------------
         pattern_name = pattern_info["Pattern"]
         sell_signals = pattern_info["Sell_Signals"]
@@ -660,7 +685,7 @@ if ticker_input:
             if pattern_info['Near_52W_High'] and pattern_info['Volume_Surge']:
                 st.success(f"🟢 **BUY SIGNAL / ACTIONABLE BREAKOUT:** **{ticker_input}** is breaking out from a **{pattern_name}** on heavy volume!")
             else:
-                st.info(f"👀 **WATCH / BASE BUILDING:** **{ticker_input}** is constructing a valid **{pattern_name}** base structure near highs. Monitor for a volume-backed breakout above the pivot point.")
+                st.info(f"👀 **WATCH / BASE BUILDING:** **{ticker_input}** is constructing a valid **{pattern_name}** base structure near highs. Monitor for a volume-backed breakout above pivot point.")
 
         else:
             st.warning(f"⚪ **HOLD / NEUTRAL:** **{ticker_input}** is currently consolidating in a **{pattern_name}**.")
@@ -711,14 +736,13 @@ if ticker_input:
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS
+        # TAB 2: FUNDAMENTALS (DEDUPLICATED)
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
                 st.caption("Displays Quarterly Sales, YoY Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted chronologically (Most Recent at Top).")
                 
                 display_df = q_summary.copy()
-                display_df['Quarter / Date'] = display_df.index
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
                 display_df['YoY Sales Growth'] = display_df['YoY Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
