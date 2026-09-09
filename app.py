@@ -212,7 +212,7 @@ def fetch_financial_data(ticker_symbol):
         q_income = ticker.quarterly_incomestmt
         q_combined = q_financials if not q_financials.empty else q_income
         
-        # 24-Quarter Extended Earnings Dates
+        # Extended Earnings Dates
         earnings_dates = pd.DataFrame()
         try:
             ed = ticker.get_earnings_dates(limit=32)
@@ -330,10 +330,8 @@ def calculate_technicals(df):
     return df
 
 def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
-    """Combines quarterly statements and earnings history to produce up to 24 quarters of history."""
     records = {}
 
-    # 1. Parse Quarterly Financials
     if q_df is not None and not q_df.empty:
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
@@ -349,7 +347,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
                 "Quarterly EPS ($)": pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
             }
 
-    # 2. Extract Extended EPS History from Earnings Calendar
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
         for dt, row in ed_clean.iterrows():
@@ -368,7 +365,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     summary['Date'] = pd.to_datetime(summary['Date'])
     summary = summary.sort_values('Date', ascending=True)
 
-    # 3. Calculate YoY/QoQ Growth Rates across all 24 quarters
     summary['QoQ Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(1) * 100
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
 
@@ -424,7 +420,7 @@ def detect_chart_patterns(df):
     }
 
 # ==========================================
-# 6. FRAGMENTED INTERACTIVE CHARTS
+# 6. TECHNICAL CHART FRAGMENT
 # ==========================================
 @st.fragment
 def render_technical_chart(df_price):
@@ -451,55 +447,6 @@ def render_technical_chart(df_price):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-@st.fragment
-def render_fundamental_chart_24q(q_summary):
-    """Renders up to 24 quarters with explicit EPS Dots & Markers."""
-    q_plot = q_summary.sort_values('Date', ascending=True)
-    
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # Revenue Bars
-    fig.add_trace(
-        go.Bar(
-            x=q_plot['Quarter_Label'],
-            y=q_plot['Quarterly Revenue ($)'],
-            name="Quarterly Revenue ($)",
-            marker_color='#2962ff'
-        ),
-        secondary_y=False
-    )
-    
-    # EPS Lines + Dots (Explicitly rendered)
-    fig.add_trace(
-        go.Scatter(
-            x=q_plot['Quarter_Label'],
-            y=q_plot['YoY EPS Growth (%)'],
-            name="YoY EPS Growth (%)",
-            mode='lines+markers',
-            line=dict(color='#089981', width=3),
-            marker=dict(
-                size=9,
-                color='#089981',
-                symbol='circle',
-                line=dict(color='#ffffff', width=1.5)
-            )
-        ),
-        secondary_y=True
-    )
-    
-    fig.update_layout(
-        title_text="24-Quarter Sales ($) & YoY EPS Growth Trajectory",
-        template="plotly_dark",
-        height=450,
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(type='category')
-    )
-    fig.update_yaxes(title_text="Revenue ($)", secondary_y=False)
-    fig.update_yaxes(title_text="YoY EPS Growth (%)", secondary_y=True)
-    
-    st.plotly_chart(fig, use_container_width=True)
-
 # ==========================================
 # 7. MAIN APPLICATION LAYOUT & DASHBOARD
 # ==========================================
@@ -508,23 +455,22 @@ st.title("📈 CAN SLIM Equity Analytics Platform")
 # State Initialization
 if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "NVDA"
-if "peers" not in st.session_state:
-    st.session_state["peers"] = get_watchlist_peers_string("NVDA")
+if "peers_input_box" not in st.session_state:
+    st.session_state["peers_input_box"] = get_watchlist_peers_string("NVDA")
 
 # Sync Callback Functions
 def update_from_dropdown():
     selected_name = st.session_state["watchlist_selector"]
     ticker = WATCHLIST_OPTIONS[selected_name]
     st.session_state["selected_ticker"] = ticker
-    st.session_state["peers"] = get_watchlist_peers_string(ticker)
+    st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
 
 def update_from_manual():
     ticker = st.session_state["manual_input"].upper().strip()
     if ticker:
         st.session_state["selected_ticker"] = ticker
-        st.session_state["peers"] = get_watchlist_peers_string(ticker)
+        st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
 
-# Find corresponding dropdown index safely
 current_ticker = st.session_state["selected_ticker"]
 dropdown_default_idx = 0
 for i, (label, symbol) in enumerate(WATCHLIST_OPTIONS.items()):
@@ -552,7 +498,6 @@ with st.sidebar:
     
     st.text_input(
         "Auto-Populated Peer Group",
-        value=st.session_state["peers"],
         key="peers_input_box"
     )
     st.caption("Peer tickers auto-populate based on sector relationships and recommendation endpoints.")
@@ -640,8 +585,6 @@ if ticker_input:
         # TAB 2: FUNDAMENTALS
         with tab_fund:
             if not q_summary.empty:
-                render_fundamental_chart_24q(q_summary)
-                
                 st.markdown("### Extended Quarterly Fundamental History")
                 st.caption("Displays Quarterly Sales, YoY/QoQ Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
                 
