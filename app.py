@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import find_peaks
@@ -83,23 +84,58 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Sector Peer Mapping for Dynamic Sidebar Auto-Population
-DEFAULT_SECTOR_PEERS = {
-    "NVDA": "AMD, AVGO, INTC, TSM, QCOM, MU",
-    "AMD": "NVDA, AVGO, INTC, TSM, QCOM, MU",
-    "AVGO": "NVDA, AMD, INTC, TSM, QCOM, TXN",
-    "AAPL": "MSFT, GOOGL, AMZN, META, TSLA",
-    "MSFT": "AAPL, GOOGL, AMZN, META, ORCL",
-    "GOOGL": "MSFT, AAPL, AMZN, META, NFLX",
-    "AMZN": "MSFT, GOOGL, AAPL, WMT, SHOP",
-    "META": "GOOGL, MSFT, SNAP, PINS, NFLX",
-    "TSLA": "RIVN, LCID, GM, F, BYD",
-    "JPM": "BAC, WFC, C, GS, MS",
-    "LLY": "NVO, PFE, MRK, JNJ, ABBV"
+# ==========================================
+# 2. WATCHLIST MAPPING & PEER DISCOVERY
+# ==========================================
+WATCHLIST_PEERS = {
+    "NVDA": ["MU", "SMCI", "ALAB", "CRDO", "000660.KS"],
+    "APP": ["RDDT", "DUOL", "MDB", "CART"],
+    "PLTR": ["MDB", "IOT", "AXON", "ANET"],
+    "CLS": ["SMCI", "CRDO", "ALAB", "FIX"],
+    "CRDO": ["ALAB", "CLS", "ANET", "NVDA"],
+    "ALAB": ["CRDO", "NVDA", "CLS", "MU"],
+    "RDDT": ["APP", "DUOL", "CART", "MDB"],
+    "DUOL": ["APP", "RDDT", "CART"],
+    "MELI": ["CART", "DUOL", "CELH"],
+    "SMCI": ["CLS", "NVDA", "ANET", "CRDO"],
+    "IOT": ["PLTR", "AXON", "FIX", "ANET"],
+    "AXON": ["PLTR", "IOT", "FIX"],
+    "FIX": ["CLS", "AXON", "ANET"],
+    "ANET": ["CRDO", "SMCI", "PLTR", "FIX"],
+    "COCO": ["CELH", "MELI"],
+    "MDB": ["PLTR", "APP", "RDDT", "IOT"],
+    "CELH": ["COCO", "MELI"],
+    "LUNR": ["AXON", "PLTR"],
+    "CART": ["APP", "DUOL", "MELI", "RDDT"],
+    "AER": ["FIX", "AXON"],
+    "MU": ["NVDA", "000660.KS", "ALAB", "CRDO"],
+    "000660.KS": ["MU", "NVDA", "ALAB"]
 }
 
+def fetch_online_peers(ticker_symbol):
+    """Fallback: Scrapes dynamic institutional peer recommendations from Yahoo Finance API."""
+    try:
+        url = f"https://query2.finance.yahoo.com/v6/finance/recommendationsbyticker/{ticker_symbol.upper()}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            result = res.json().get('finance', {}).get('result', [])
+            if result and 'recommendedSymbols' in result[0]:
+                peers = [item['symbol'] for item in result[0]['recommendedSymbols']]
+                if peers:
+                    return ", ".join(peers[:5])
+    except Exception:
+        pass
+    return "NVDA, MU, PLTR, ANET, SMCI"
+
+def get_watchlist_peers_string(ticker_symbol):
+    ticker_symbol = ticker_symbol.upper().strip()
+    if ticker_symbol in WATCHLIST_PEERS:
+        return ", ".join(WATCHLIST_PEERS[ticker_symbol])
+    return fetch_online_peers(ticker_symbol)
+
 # ==========================================
-# 2. HELPER UTILITIES
+# 3. HELPER UTILITIES
 # ==========================================
 def format_large_number(num):
     if num is None or np.isnan(num):
@@ -118,12 +154,11 @@ def format_pct(num):
     return f"{num:+.2f}%"
 
 def date_to_quarter_str(dt):
-    """Converts Datetime to Fiscal Quarter String (e.g., Q2 2026)."""
     quarter = (dt.month - 1) // 3 + 1
     return f"Q{quarter} {dt.year}"
 
 # ==========================================
-# 3. CACHED DATA FETCHING ENGINE
+# 4. CACHED DATA FETCHING ENGINE
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financial_data(ticker_symbol):
@@ -138,7 +173,7 @@ def fetch_financial_data(ticker_symbol):
         if df_price.index.tz is not None:
             df_price.index = df_price.index.tz_localize(None)
 
-        # S&P 500 Relative Benchmark
+        # S&P 500 Benchmark Comparison
         sp500 = yf.Ticker("^GSPC").history(period="max", interval="1d")
         if not sp500.empty and sp500.index.tz is not None:
             sp500.index = sp500.index.tz_localize(None)
@@ -154,12 +189,12 @@ def fetch_financial_data(ticker_symbol):
         info = ticker.info if ticker.info else {}
         raw_news = ticker.news if hasattr(ticker, 'news') else []
 
-        # Parse News Articles & Hyperlinks
+        # Parse Headline Summaries & Links
         parsed_news = []
         for item in raw_news:
             title = item.get('title') or item.get('content', {}).get('title', 'Corporate News Update')
             publisher = item.get('publisher') or item.get('content', {}).get('provider', {}).get('displayName', 'Financial News')
-            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational news and market performance headline.')
+            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational developments and stock updates.')
             link = item.get('link') or item.get('content', {}).get('canonicalUrl', {}).get('url', '#')
             
             parsed_news.append({
@@ -232,20 +267,13 @@ def fetch_institutional_trends(ticker_symbol):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_one_time_expenses(ticker_symbol):
-    if ticker_symbol == "NVDA":
-        return pd.DataFrame([
-            {"Quarter": "Q2 2026", "GAAP EPS": "$2.46", "Non-GAAP EPS": "$2.22", "Adjustment Impact": "+ $0.24/sh GAAP Gain", "Specific One-Time Items & Reconciliation": "Net Unrealized Investment Benefit (+ $0.32/sh under GAAP). Intangible Amortization (~$176M)."},
-            {"Quarter": "Q1 2026", "GAAP EPS": "$2.39", "Non-GAAP EPS": "$1.87", "Adjustment Impact": "+ $0.52/sh GAAP Gain", "Specific One-Time Items & Reconciliation": "Strategic Investment Fair-Value Gain (+ $0.52/sh GAAP benefit). Acquisition Amortization (~$172M)."},
-            {"Quarter": "Q4 2025", "GAAP EPS": "$1.76", "Non-GAAP EPS": "$1.62", "Adjustment Impact": "+ $0.14/sh GAAP Gain", "Specific One-Time Items & Reconciliation": "Discrete Tax Adjustments (~$1.4B benefit). SBC Expense (~$1.69B) excluded in Non-GAAP metrics."},
-            {"Quarter": "Q3 2025", "GAAP EPS": "$1.30", "Non-GAAP EPS": "$1.30", "Adjustment Impact": "$0.00 Parity", "Specific One-Time Items & Reconciliation": "SBC Charges (~$1.62B) & Amortization (~$110M) offset by discrete non-operating tax benefits."}
-        ])
     return pd.DataFrame([
         {"Quarter": "Q2 2026", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Stock-Based Compensation & Intangible Amortization Charges."},
         {"Quarter": "Q1 2026", "GAAP EPS": "Standard GAAP", "Non-GAAP EPS": "Adjusted", "Adjustment Impact": "Variable", "Specific One-Time Items & Reconciliation": "Restructuring expenses, litigation provisions, and tax adjustments."}
     ])
 
 # ==========================================
-# 4. TECHNICAL & FUNDAMENTAL CALCULATIONS
+# 5. TECHNICAL & FUNDAMENTAL CALCULATIONS
 # ==========================================
 def calculate_technicals(df):
     df = df.copy()
@@ -317,7 +345,6 @@ def process_quarterly_fundamentals_extended(q_df, info_dict):
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    # Label X-Axis with Fiscal Quarter & Year
     summary['Quarter_Label'] = [date_to_quarter_str(d) for d in summary.index]
 
     return summary.sort_index(ascending=False), latest_accel_q
@@ -340,6 +367,8 @@ def detect_chart_patterns(df):
         depth = (left_rim - bottom) / left_rim
         if 0.12 <= depth <= 0.40 and abs(left_rim - right_rim) / left_rim <= 0.15:
             pattern = "Cup with Handle"
+        elif len(peaks) >= 2 and len(troughs) >= 2:
+            pattern = "W Bottom / Double Bottom"
             
     max_52w = df['High'].tail(252).max()
     latest_close = df['Close'].iloc[-1]
@@ -351,7 +380,7 @@ def detect_chart_patterns(df):
     }
 
 # ==========================================
-# 5. FRAGMENTED INTERACTIVE CHARTS
+# 6. FRAGMENTED INTERACTIVE CHARTS
 # ==========================================
 @st.fragment
 def render_technical_chart(df_price):
@@ -380,7 +409,6 @@ def render_technical_chart(df_price):
 
 @st.fragment
 def render_fundamental_chart_24q(q_summary):
-    """Renders up to 24 quarters of Revenue ($) and YoY EPS Growth (%) with Quarter & Year X-Axis."""
     q_plot = q_summary.tail(24).sort_index(ascending=True)
     
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -421,31 +449,80 @@ def render_fundamental_chart_24q(q_summary):
     st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
-# 6. MAIN APPLICATION LAYOUT & DASHBOARD
+# 7. MAIN APPLICATION LAYOUT & DASHBOARD
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
-# Dynamic Peer State Initialization
+# Target Universe Mapping
+WATCHLIST_OPTIONS = {
+    "Nvidia (NVDA)": "NVDA",
+    "AppLovin (APP)": "APP",
+    "Palantir (PLTR)": "PLTR",
+    "Celestica (CLS)": "CLS",
+    "Credo Technology (CRDO)": "CRDO",
+    "Astera Labs (ALAB)": "ALAB",
+    "Reddit (RDDT)": "RDDT",
+    "Duolingo (DUOL)": "DUOL",
+    "MercadoLibre (MELI)": "MELI",
+    "Super Micro Computer (SMCI)": "SMCI",
+    "Samsara (IOT)": "IOT",
+    "Axon Enterprise (AXON)": "AXON",
+    "Comfort Systems (FIX)": "FIX",
+    "Arista Networks (ANET)": "ANET",
+    "The Vita Coco Company (COCO)": "COCO",
+    "MongoDB (MDB)": "MDB",
+    "Celsius Holdings (CELH)": "CELH",
+    "Intuitive Machines (LUNR)": "LUNR",
+    "Maplebear / Instacart (CART)": "CART",
+    "AerCap Holdings (AER)": "AER",
+    "Micron Technology (MU)": "MU",
+    "SK Hynix (000660.KS)": "000660.KS"
+}
+
+# Dynamic Auto-Population Callback
+def on_watchlist_change():
+    selected_name = st.session_state["watchlist_selector"]
+    ticker = WATCHLIST_OPTIONS[selected_name]
+    st.session_state["ticker"] = ticker
+    st.session_state["peers"] = get_watchlist_peers_string(ticker)
+
+def on_manual_ticker_change():
+    ticker = st.session_state["manual_ticker_input"].upper().strip()
+    st.session_state["ticker"] = ticker
+    st.session_state["peers"] = get_watchlist_peers_string(ticker)
+
+# State Management Initialization
 if "ticker" not in st.session_state:
     st.session_state["ticker"] = "NVDA"
 if "peers" not in st.session_state:
-    st.session_state["peers"] = DEFAULT_SECTOR_PEERS["NVDA"]
+    st.session_state["peers"] = get_watchlist_peers_string("NVDA")
 
-# Dynamic Auto-Population Callback
-def on_ticker_change():
-    new_ticker = st.session_state["ticker_input_box"].upper().strip()
-    st.session_state["ticker"] = new_ticker
-    if new_ticker in DEFAULT_SECTOR_PEERS:
-        st.session_state["peers"] = DEFAULT_SECTOR_PEERS[new_ticker]
-
-# Sidebar Parameters Form
 with st.sidebar:
-    st.header("Search & Parameters")
-    st.text_input("Ticker Symbol", value=st.session_state["ticker"], key="ticker_input_box", on_change=on_ticker_change)
-    st.text_input("Peers (Comma-Separated)", value=st.session_state["peers"], key="peers_input_box")
-    st.caption("Peers auto-populate based on sector classification when entering a standard ticker.")
+    st.header("Focus Watchlist & Parameters")
+    
+    st.selectbox(
+        "Select Target Stock",
+        options=list(WATCHLIST_OPTIONS.keys()),
+        index=0,
+        key="watchlist_selector",
+        on_change=on_watchlist_change
+    )
+    
+    st.text_input(
+        "Or Enter Custom Ticker",
+        value=st.session_state["ticker"],
+        key="manual_ticker_input",
+        on_change=on_manual_ticker_change
+    )
+    
+    st.text_input(
+        "Auto-Populated Peer Group",
+        value=st.session_state["peers"],
+        key="peers_input_box"
+    )
+    st.caption("Peer tickers auto-populate based on sector relationships and online recommendation endpoints.")
 
-ticker_input = st.session_state["ticker_input_box"].upper().strip()
+ticker_input = st.session_state["ticker"].upper().strip()
 peer_input = st.session_state["peers_input_box"].upper()
 
 if ticker_input:
@@ -559,13 +636,13 @@ if ticker_input:
             one_time_df = fetch_one_time_expenses(ticker_input)
             st.dataframe(one_time_df, use_container_width=True)
 
-        # TAB 3: INSTITUTIONAL, PEERS & NEWS
+        # TAB 3: INSTITUTIONAL, PEERS & NEWS INTELLIGENCE
         with tab_peers:
             col_p1, col_p2 = st.columns([1.1, 0.9])
             
             with col_p1:
                 st.markdown("### 🏆 Peer Group Comparison")
-                st.caption("Relative performance metrics across key operating peers.")
+                st.caption("Relative performance metrics across key target watchlist peers.")
                 peer_df = fetch_peer_benchmark(ticker_input, peer_input.split(","))
                 st.dataframe(peer_df, use_container_width=True)
 
@@ -577,11 +654,11 @@ if ticker_input:
 
             st.markdown("---")
             st.markdown("### 🚀 Material Growth Catalysts & Corporate Intelligence")
-            st.caption("Real-time headline summaries and hyperlinked news articles from primary sources.")
+            st.caption("Real-time news articles and corporate developments to analyze selling pressure, distribution, or catalysts.")
             
             news_list = data.get('news', [])
             if news_list:
-                for item in news_list[:6]:
+                for item in news_list[:8]:
                     st.markdown(f"""
                     <div class="news-card">
                         <a href="{item['link']}" target="_blank" class="news-title">{item['title']} ↗</a>
