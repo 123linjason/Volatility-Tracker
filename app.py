@@ -70,7 +70,7 @@ st.markdown("""
     .badge-fail { background-color: #f2364522; color: #f23645; border: 1px solid #f23645; font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; display: inline-block; margin-top: 4px; }
     .badge-neutral { background-color: #ff980022; color: #ff9800; border: 1px solid #ff9800; font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; display: inline-block; margin-top: 4px; }
     
-    /* Clean News / Catalyst Container */
+    /* Clean News Container */
     .news-card {
         background-color: #1a1e29;
         border-left: 3px solid #2962ff;
@@ -87,6 +87,31 @@ st.markdown("""
 # ==========================================
 # 2. WATCHLIST MAPPING & PEER DISCOVERY
 # ==========================================
+WATCHLIST_OPTIONS = {
+    "Nvidia (NVDA)": "NVDA",
+    "AppLovin (APP)": "APP",
+    "Palantir (PLTR)": "PLTR",
+    "Celestica (CLS)": "CLS",
+    "Credo Technology (CRDO)": "CRDO",
+    "Astera Labs (ALAB)": "ALAB",
+    "Reddit (RDDT)": "RDDT",
+    "Duolingo (DUOL)": "DUOL",
+    "MercadoLibre (MELI)": "MELI",
+    "Super Micro Computer (SMCI)": "SMCI",
+    "Samsara (IOT)": "IOT",
+    "Axon Enterprise (AXON)": "AXON",
+    "Comfort Systems (FIX)": "FIX",
+    "Arista Networks (ANET)": "ANET",
+    "The Vita Coco Company (COCO)": "COCO",
+    "MongoDB (MDB)": "MDB",
+    "Celsius Holdings (CELH)": "CELH",
+    "Intuitive Machines (LUNR)": "LUNR",
+    "Maplebear / Instacart (CART)": "CART",
+    "AerCap Holdings (AER)": "AER",
+    "Micron Technology (MU)": "MU",
+    "SK Hynix (000660.KS)": "000660.KS"
+}
+
 WATCHLIST_PEERS = {
     "NVDA": ["MU", "SMCI", "ALAB", "CRDO", "000660.KS"],
     "APP": ["RDDT", "DUOL", "MDB", "CART"],
@@ -113,7 +138,6 @@ WATCHLIST_PEERS = {
 }
 
 def fetch_online_peers(ticker_symbol):
-    """Fallback: Scrapes dynamic institutional peer recommendations from Yahoo Finance API."""
     try:
         url = f"https://query2.finance.yahoo.com/v6/finance/recommendationsbyticker/{ticker_symbol.upper()}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -154,6 +178,8 @@ def format_pct(num):
     return f"{num:+.2f}%"
 
 def date_to_quarter_str(dt):
+    if isinstance(dt, str):
+        dt = pd.to_datetime(dt)
     quarter = (dt.month - 1) // 3 + 1
     return f"Q{quarter} {dt.year}"
 
@@ -186,15 +212,26 @@ def fetch_financial_data(ticker_symbol):
         q_income = ticker.quarterly_incomestmt
         q_combined = q_financials if not q_financials.empty else q_income
         
+        # 24-Quarter Extended Earnings Dates
+        earnings_dates = pd.DataFrame()
+        try:
+            ed = ticker.get_earnings_dates(limit=32)
+            if ed is not None and not ed.empty:
+                if ed.index.tz is not None:
+                    ed.index = ed.index.tz_localize(None)
+                earnings_dates = ed
+        except Exception:
+            pass
+        
         info = ticker.info if ticker.info else {}
         raw_news = ticker.news if hasattr(ticker, 'news') else []
 
-        # Parse Headline Summaries & Links
+        # Parse News Articles
         parsed_news = []
         for item in raw_news:
             title = item.get('title') or item.get('content', {}).get('title', 'Corporate News Update')
             publisher = item.get('publisher') or item.get('content', {}).get('provider', {}).get('displayName', 'Financial News')
-            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational developments and stock updates.')
+            summary = item.get('summary') or item.get('content', {}).get('summary', 'Recent operational developments.')
             link = item.get('link') or item.get('content', {}).get('canonicalUrl', {}).get('url', '#')
             
             parsed_news.append({
@@ -207,6 +244,7 @@ def fetch_financial_data(ticker_symbol):
         return {
             "price_data": df_price,
             "q_financials": q_combined,
+            "earnings_dates": earnings_dates,
             "info": info,
             "news": parsed_news
         }, None
@@ -291,63 +329,69 @@ def calculate_technicals(df):
     
     return df
 
-def process_quarterly_fundamentals_extended(q_df, info_dict):
-    """Processes quarterly fundamentals going back up to 24 quarters without N/A truncation."""
-    if q_df is None or q_df.empty:
+def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
+    """Combines quarterly statements and earnings history to produce up to 24 quarters of history."""
+    records = {}
+
+    # 1. Parse Quarterly Financials
+    if q_df is not None and not q_df.empty:
+        df_t = q_df.T.copy()
+        df_t.index = pd.to_datetime(df_t.index)
+        
+        rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
+        eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
+        
+        for dt, row in df_t.iterrows():
+            q_key = date_to_quarter_str(dt)
+            records[q_key] = {
+                "Date": dt,
+                "Quarterly Revenue ($)": pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan,
+                "Quarterly EPS ($)": pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
+            }
+
+    # 2. Extract Extended EPS History from Earnings Calendar
+    if ed_df is not None and not ed_df.empty:
+        ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
+        for dt, row in ed_clean.iterrows():
+            q_key = date_to_quarter_str(dt)
+            reported_eps = pd.to_numeric(row['Reported EPS'], errors='coerce')
+            
+            if q_key not in records:
+                records[q_key] = {"Date": dt, "Quarterly Revenue ($)": np.nan, "Quarterly EPS ($)": reported_eps}
+            elif np.isnan(records[q_key]["Quarterly EPS ($)"]):
+                records[q_key]["Quarterly EPS ($)"] = reported_eps
+
+    if not records:
         return pd.DataFrame(), "N/A"
-    
-    df = q_df.T.copy()
-    df.index = pd.to_datetime(df.index)
-    df = df.sort_index(ascending=True)
 
-    non_gaap_col = [c for c in df.columns if 'Normalized EPS' in str(c) or 'Non-GAAP EPS' in str(c)]
-    eps_col = [c for c in df.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
-    net_inc_col = [c for c in df.columns if 'Net Income' in str(c)]
-    rev_col = [c for c in df.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
-    
-    summary = pd.DataFrame(index=df.index)
+    summary = pd.DataFrame.from_dict(records, orient='index')
+    summary['Date'] = pd.to_datetime(summary['Date'])
+    summary = summary.sort_values('Date', ascending=True)
 
-    if rev_col:
-        summary['Quarterly Revenue ($)'] = pd.to_numeric(df[rev_col[0]], errors='coerce')
-    else:
-        summary['Quarterly Revenue ($)'] = np.nan
-
-    if non_gaap_col:
-        summary['Quarterly EPS ($)'] = pd.to_numeric(df[non_gaap_col[0]], errors='coerce')
-    elif eps_col:
-        summary['Quarterly EPS ($)'] = pd.to_numeric(df[eps_col[0]], errors='coerce')
-    elif net_inc_col:
-        shares = info_dict.get('sharesOutstanding', 1)
-        summary['Quarterly EPS ($)'] = pd.to_numeric(df[net_inc_col[0]], errors='coerce') / shares
-    else:
-        summary['Quarterly EPS ($)'] = np.nan
-
-    # Calculate Growth Rates across all available quarters (up to 24)
+    # 3. Calculate YoY/QoQ Growth Rates across all 24 quarters
     summary['QoQ Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(1) * 100
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
 
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
 
-    # TTM (Rolling 4 Quarters)
     summary['Annual Sales (TTM)'] = summary['Quarterly Revenue ($)'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['Quarterly EPS ($)'].rolling(window=4, min_periods=1).sum()
 
-    # Acceleration Indicators
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
     accel_quarters = summary[summary['Acceleration_Start']].index
-    latest_accel_q = date_to_quarter_str(accel_quarters[-1]) if len(accel_quarters) > 0 else "N/A"
+    latest_accel_q = accel_quarters[-1] if len(accel_quarters) > 0 else "N/A"
 
     summary['Status Indicator'] = np.where(
         summary['Acceleration_Start'], "🚀 Acceleration Started",
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    summary['Quarter_Label'] = [date_to_quarter_str(d) for d in summary.index]
+    summary['Quarter_Label'] = summary.index
 
-    return summary.sort_index(ascending=False), latest_accel_q
+    return summary.sort_values('Date', ascending=False).tail(24), latest_accel_q
 
 def detect_chart_patterns(df):
     if len(df) < 200:
@@ -409,10 +453,12 @@ def render_technical_chart(df_price):
 
 @st.fragment
 def render_fundamental_chart_24q(q_summary):
-    q_plot = q_summary.tail(24).sort_index(ascending=True)
+    """Renders up to 24 quarters with explicit EPS Dots & Markers."""
+    q_plot = q_summary.sort_values('Date', ascending=True)
     
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
+    # Revenue Bars
     fig.add_trace(
         go.Bar(
             x=q_plot['Quarter_Label'],
@@ -423,6 +469,7 @@ def render_fundamental_chart_24q(q_summary):
         secondary_y=False
     )
     
+    # EPS Lines + Dots (Explicitly rendered)
     fig.add_trace(
         go.Scatter(
             x=q_plot['Quarter_Label'],
@@ -430,7 +477,12 @@ def render_fundamental_chart_24q(q_summary):
             name="YoY EPS Growth (%)",
             mode='lines+markers',
             line=dict(color='#089981', width=3),
-            marker=dict(size=6)
+            marker=dict(
+                size=9,
+                color='#089981',
+                symbol='circle',
+                line=dict(color='#ffffff', width=1.5)
+            )
         ),
         secondary_y=True
     )
@@ -438,7 +490,7 @@ def render_fundamental_chart_24q(q_summary):
     fig.update_layout(
         title_text="24-Quarter Sales ($) & YoY EPS Growth Trajectory",
         template="plotly_dark",
-        height=430,
+        height=450,
         margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         xaxis=dict(type='category')
@@ -453,49 +505,32 @@ def render_fundamental_chart_24q(q_summary):
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
-# Target Universe Mapping
-WATCHLIST_OPTIONS = {
-    "Nvidia (NVDA)": "NVDA",
-    "AppLovin (APP)": "APP",
-    "Palantir (PLTR)": "PLTR",
-    "Celestica (CLS)": "CLS",
-    "Credo Technology (CRDO)": "CRDO",
-    "Astera Labs (ALAB)": "ALAB",
-    "Reddit (RDDT)": "RDDT",
-    "Duolingo (DUOL)": "DUOL",
-    "MercadoLibre (MELI)": "MELI",
-    "Super Micro Computer (SMCI)": "SMCI",
-    "Samsara (IOT)": "IOT",
-    "Axon Enterprise (AXON)": "AXON",
-    "Comfort Systems (FIX)": "FIX",
-    "Arista Networks (ANET)": "ANET",
-    "The Vita Coco Company (COCO)": "COCO",
-    "MongoDB (MDB)": "MDB",
-    "Celsius Holdings (CELH)": "CELH",
-    "Intuitive Machines (LUNR)": "LUNR",
-    "Maplebear / Instacart (CART)": "CART",
-    "AerCap Holdings (AER)": "AER",
-    "Micron Technology (MU)": "MU",
-    "SK Hynix (000660.KS)": "000660.KS"
-}
-
-# Dynamic Auto-Population Callback
-def on_watchlist_change():
-    selected_name = st.session_state["watchlist_selector"]
-    ticker = WATCHLIST_OPTIONS[selected_name]
-    st.session_state["ticker"] = ticker
-    st.session_state["peers"] = get_watchlist_peers_string(ticker)
-
-def on_manual_ticker_change():
-    ticker = st.session_state["manual_ticker_input"].upper().strip()
-    st.session_state["ticker"] = ticker
-    st.session_state["peers"] = get_watchlist_peers_string(ticker)
-
-# State Management Initialization
-if "ticker" not in st.session_state:
-    st.session_state["ticker"] = "NVDA"
+# State Initialization
+if "selected_ticker" not in st.session_state:
+    st.session_state["selected_ticker"] = "NVDA"
 if "peers" not in st.session_state:
     st.session_state["peers"] = get_watchlist_peers_string("NVDA")
+
+# Sync Callback Functions
+def update_from_dropdown():
+    selected_name = st.session_state["watchlist_selector"]
+    ticker = WATCHLIST_OPTIONS[selected_name]
+    st.session_state["selected_ticker"] = ticker
+    st.session_state["peers"] = get_watchlist_peers_string(ticker)
+
+def update_from_manual():
+    ticker = st.session_state["manual_input"].upper().strip()
+    if ticker:
+        st.session_state["selected_ticker"] = ticker
+        st.session_state["peers"] = get_watchlist_peers_string(ticker)
+
+# Find corresponding dropdown index safely
+current_ticker = st.session_state["selected_ticker"]
+dropdown_default_idx = 0
+for i, (label, symbol) in enumerate(WATCHLIST_OPTIONS.items()):
+    if symbol == current_ticker:
+        dropdown_default_idx = i
+        break
 
 with st.sidebar:
     st.header("Focus Watchlist & Parameters")
@@ -503,16 +538,16 @@ with st.sidebar:
     st.selectbox(
         "Select Target Stock",
         options=list(WATCHLIST_OPTIONS.keys()),
-        index=0,
+        index=dropdown_default_idx,
         key="watchlist_selector",
-        on_change=on_watchlist_change
+        on_change=update_from_dropdown
     )
     
     st.text_input(
         "Or Enter Custom Ticker",
-        value=st.session_state["ticker"],
-        key="manual_ticker_input",
-        on_change=on_manual_ticker_change
+        value=current_ticker,
+        key="manual_input",
+        on_change=update_from_manual
     )
     
     st.text_input(
@@ -520,9 +555,9 @@ with st.sidebar:
         value=st.session_state["peers"],
         key="peers_input_box"
     )
-    st.caption("Peer tickers auto-populate based on sector relationships and online recommendation endpoints.")
+    st.caption("Peer tickers auto-populate based on sector relationships and recommendation endpoints.")
 
-ticker_input = st.session_state["ticker"].upper().strip()
+ticker_input = st.session_state["selected_ticker"]
 peer_input = st.session_state["peers_input_box"].upper()
 
 if ticker_input:
@@ -534,7 +569,7 @@ if ticker_input:
     else:
         df_price = calculate_technicals(data['price_data'])
         info = data['info']
-        q_summary, accel_start_q = process_quarterly_fundamentals_extended(data['q_financials'], info)
+        q_summary, accel_start_q = process_quarterly_fundamentals_24q(data['q_financials'], data['earnings_dates'], info)
         pattern_info = detect_chart_patterns(df_price)
 
         # -------------------------------------------------------------
@@ -602,14 +637,14 @@ if ticker_input:
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS & EXPENSES
+        # TAB 2: FUNDAMENTALS
         with tab_fund:
-            render_fundamental_chart_24q(q_summary)
-            
-            st.markdown("### Extended Quarterly Fundamental History")
-            st.caption("Displays Quarterly Sales, YoY/QoQ Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
-            
             if not q_summary.empty:
+                render_fundamental_chart_24q(q_summary)
+                
+                st.markdown("### Extended Quarterly Fundamental History")
+                st.caption("Displays Quarterly Sales, YoY/QoQ Sales Growth, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals formatted by Quarter & Year.")
+                
                 display_df = q_summary.copy()
                 display_df.index = display_df['Quarter_Label']
                 
