@@ -5,7 +5,6 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.signal import find_peaks
 
 # ==========================================
 # 1. PAGE CONFIGURATION & CUSTOM STYLES
@@ -39,9 +38,12 @@ st.markdown("""
     }
     .metric-value {
         color: #ffffff;
-        font-size: 19px;
+        font-size: 18px;
         font-weight: 700;
         margin-top: 1px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
     .metric-sub {
         font-size: 11px;
@@ -226,7 +228,6 @@ def fetch_financial_data(ticker_symbol):
         info = ticker.info if ticker.info else {}
         raw_news = ticker.news if hasattr(ticker, 'news') else []
 
-        # Parse News Articles
         parsed_news = []
         for item in raw_news:
             title = item.get('title') or item.get('content', {}).get('title', 'Corporate News Update')
@@ -318,7 +319,7 @@ def calculate_technicals(df):
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
     df['Vol_SMA_50'] = df['Volume'].rolling(window=50).mean()
-    df['Volume_Surge'] = (df['Volume'] >= 1.45 * df['Vol_SMA_50'])
+    df['Volume_Surge'] = (df['Volume'] >= 1.40 * df['Vol_SMA_50'])
     
     df['Price_Change'] = df['Close'] - df['Close'].shift(1)
     df['Volume_Color'] = np.where(df['Price_Change'] >= 0, '#089981', '#f23645')
@@ -388,51 +389,77 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
 
     return summary.sort_values('Date', ascending=False).tail(24), latest_accel_q
 
+# ==========================================
+# REVISED DYNAMIC PATTERN DETECTION ALGORITHM
+# ==========================================
 def detect_chart_patterns(df):
     if df is None or len(df) < 60:
         return {"Pattern": "Insufficient Data", "Near_52W_High": False, "Volume_Surge": False}
 
+    close = df['Close']
     high = df['High']
     low = df['Low']
-    close = df['Close']
 
-    max_52w = high.tail(252).max()
-    min_52w = low.tail(252).min()
-    curr_price = close.iloc[-1]
+    # Evaluate 1-Year (252 bars) metrics
+    window = min(len(df), 252)
+    h_252 = high.tail(window)
+    l_252 = low.tail(window)
     
-    depth_pct = (max_52w - min_52w) / max_52w * 100
+    max_52w = h_252.max()
+    min_52w = l_252.min()
+    curr_price = close.iloc[-1]
+
     off_high_pct = (max_52w - curr_price) / max_52w * 100
+    base_depth_pct = (max_52w - min_52w) / max_52w * 100
 
-    # Evaluate dynamic local peaks/troughs in the last 120 bars
-    recent_df = df.tail(120)
-    highs = recent_df['High'].values
-    lows = recent_df['Low'].values
+    # Inspect last 65 bars (~13 weeks) for Handle or Pivot structures
+    recent_65_high = high.tail(65).max()
+    recent_65_low = low.tail(65).min()
+    
+    # Inspect last 15 bars (~3 weeks) for tight handle/pullback
+    recent_15_high = high.tail(15).max()
+    recent_15_low = low.tail(15).min()
+    handle_depth = (recent_15_high - recent_15_low) / recent_15_high * 100
 
-    peaks, _ = find_peaks(highs, distance=15, prominence=highs.std() * 0.2 if len(highs) > 0 else 1)
-    troughs, _ = find_peaks(-lows, distance=15, prominence=lows.std() * 0.2 if len(lows) > 0 else 1)
+    # Identify Double-Trough structure (W-Bottom) across two 30-bar windows
+    tail_60_low = low.tail(60)
+    trough1 = tail_60_low.iloc[:30].min()
+    trough2 = tail_60_low.iloc[30:].min()
+    mid_bounce = high.tail(60).iloc[15:45].max()
 
-    pattern = "Consolidation Base"
+    trough_diff_pct = abs(trough1 - trough2) / max(trough1, 1e-5) * 100
+    bounce_height_pct = (mid_bounce - min(trough1, trough2)) / max(min(trough1, trough2), 1e-5) * 100
 
-    if len(peaks) >= 2 and len(troughs) >= 2:
-        # Check for two similar lows with a middle peak recovery (W-Bottom)
-        t1, t2 = lows[troughs[-2]], lows[troughs[-1]]
-        if abs(t1 - t2) / t1 <= 0.05 and (max_52w - min(t1, t2)) / max_52w <= 0.35:
-            pattern = "W Bottom / Double Bottom"
-    elif len(peaks) >= 2 and len(troughs) >= 1:
-        # Cup with handle structure
-        left_rim, right_rim = highs[peaks[0]], highs[peaks[-1]]
-        cup_bottom = lows[troughs[-1]]
-        cup_depth = (left_rim - cup_bottom) / left_rim
-        if 0.12 <= cup_depth <= 0.40 and abs(left_rim - right_rim) / left_rim <= 0.15:
-            pattern = "Cup with Handle"
-    elif depth_pct <= 15:
+    # -------------------------------------------------------------
+    # CAN SLIM PATTERN CLASSIFICATION ENGINE
+    # -------------------------------------------------------------
+    # 1. Double Bottom / W-Bottom Rules
+    if trough_diff_pct <= 6.0 and bounce_height_pct >= 8.0 and off_high_pct <= 25:
+        pattern = "W Bottom / Double Bottom"
+
+    # 2. Cup with Handle Rules (Depth 12% to 45%, handle depth < 15%, within 20% of 52W High)
+    elif 12.0 <= base_depth_pct <= 45.0 and off_high_pct <= 20.0 and handle_depth <= 15.0:
+        pattern = "Cup with Handle"
+
+    # 3. Cup Base (Rounding bottom without handle yet)
+    elif 15.0 <= base_depth_pct <= 42.0 and off_high_pct <= 25.0:
+        pattern = "Cup Base"
+
+    # 4. Flat Base (Tight sideways range <= 15% range over 5+ weeks)
+    elif base_depth_pct <= 16.0 and off_high_pct <= 15.0:
         pattern = "Flat Base"
-    elif off_high_pct <= 8:
+
+    # 5. Ascending Base / Near Highs Consolidation
+    elif off_high_pct <= 9.0:
         pattern = "Ascending Base / Near Highs"
+
+    # 6. Fallback General Consolidation
+    else:
+        pattern = "Consolidation Base"
 
     return {
         "Pattern": pattern,
-        "Near_52W_High": curr_price >= 0.95 * max_52w,
+        "Near_52W_High": curr_price >= 0.90 * max_52w,
         "Volume_Surge": bool(df['Volume_Surge'].iloc[-1]) if 'Volume_Surge' in df.columns else False
     }
 
@@ -475,7 +502,6 @@ if "selected_ticker" not in st.session_state:
 if "peers_input_box" not in st.session_state:
     st.session_state["peers_input_box"] = get_watchlist_peers_string("NVDA")
 
-# Sync Callback Functions
 def update_from_dropdown():
     selected_name = st.session_state["watchlist_selector"]
     ticker = WATCHLIST_OPTIONS[selected_name]
@@ -551,19 +577,19 @@ if ticker_input:
         with c1:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Current Price</div><div class="metric-value">${latest_price:,.2f}</div><div class="metric-sub {chg_class}">{chg:+.2f}%</div></div>""", unsafe_allow_html=True)
         with c2:
-            st.markdown(f"""<div class="metric-card"><div class="metric-title">52-Week Range</div><div class="metric-value" style="font-size: 15px;">${min_52w:,.2f} - ${max_52w:,.2f}</div><div class="metric-sub text-neutral">High: ${max_52w:,.2f}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="metric-card"><div class="metric-title">52-Week Range</div><div class="metric-value" style="font-size: 14px;">${min_52w:,.2f} - ${max_52w:,.2f}</div><div class="metric-sub text-neutral">High: ${max_52w:,.2f}</div></div>""", unsafe_allow_html=True)
         with c3:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Market Capitalization</div><div class="metric-value">{format_large_number(info.get('marketCap'))}</div><div class="metric-sub text-neutral">Shares: {format_large_number(info.get('sharesOutstanding'))}</div></div>""", unsafe_allow_html=True)
         with c4:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Return on Equity</div><div class="metric-value">{roe_str}</div><div class="metric-sub text-neutral">Target: >17%</div></div>""", unsafe_allow_html=True)
         with c5:
-            st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 15px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 14px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
         # -------------------------------------------------------------
         # AUTOMATED BUY SIGNAL BANNER
         # -------------------------------------------------------------
         pattern_name = pattern_info["Pattern"]
-        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom"]
+        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom", "Flat Base", "Ascending Base / Near Highs"]
 
         if is_buy_candidate:
             st.success(f"🟢 **BUY RECOMMENDATION:** **{ticker_input}** is breaking out or forming an actionable **{pattern_name}** base structure.")
