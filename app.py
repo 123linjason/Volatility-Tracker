@@ -300,7 +300,7 @@ def fetch_institutional_trends(ticker_symbol):
         "Total Shares Held": shares
     })
     df['QoQ Share Change (%)'] = df['Total Shares Held'].pct_change(-1) * 100
-    df['QoQ Share Change (%)'] = df['Total Shares Held'].apply(lambda x: f"{x:,.0f}")
+    df['Total Shares Held'] = df['Total Shares Held'].apply(lambda x: f"{x:,.0f}")
     return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -333,7 +333,6 @@ def calculate_technicals(df):
     
     return df
 
-# REVISED CHRONOLOGICAL FUNDAMENTAL PROCESSING
 def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     records = {}
 
@@ -341,7 +340,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     if q_df is not None and not q_df.empty:
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
-        df_t = df_t.sort_index(ascending=True) # Sort oldest to newest for pct_change
+        df_t = df_t.sort_index(ascending=True) # Ascending for correct pct_change
         
         rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
         eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
@@ -362,7 +361,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
         ed_clean = ed_clean.sort_index(ascending=True)
         
         for dt, row in ed_clean.iterrows():
-            # Skip future estimated earnings dates
             if dt > pd.Timestamp.now():
                 continue
             q_key = f"{dt.strftime('%Y-%m-%d')} ({date_to_quarter_str(dt)})"
@@ -384,7 +382,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
     summary = pd.DataFrame.from_dict(records, orient='index')
     summary = summary.sort_values('Date', ascending=True)
 
-    # YoY / QoQ Calculations done chronologically
     summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
     summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
@@ -403,13 +400,13 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict):
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    # Sort DESCENDING so most recent earnings are at top
+    # Sort DESCENDING so most recent quarters are at top
     summary_desc = summary.sort_values('Date', ascending=False).head(24)
 
     return summary_desc, latest_accel_q
 
 # ==========================================
-# 6. ENHANCED PATTERN & SELL DETECTION ENGINE
+# 6. REVISED PATTERN & SELL ENGINE
 # ==========================================
 def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     if df is None or len(df) < 60:
@@ -418,6 +415,7 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
             "Near_52W_High": False,
             "Volume_Surge": False,
             "Sell_Signals": [],
+            "Warnings": [],
             "Is_Downtrend": False
         }
 
@@ -458,24 +456,28 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     trough_diff_pct = abs(trough1 - trough2) / max(trough1, 1e-5) * 100
     bounce_height_pct = (mid_bounce - min(trough1, trough2)) / max(min(trough1, trough2), 1e-5) * 100
 
-    sell_signals = []
+    hard_sell_signals = []
+    caution_warnings = []
 
+    # 1. HARD SELL RULES (Strict CAN SLIM Cut-Off Rules)
     if user_cost_basis and user_cost_basis > 0:
         loss_pct = (curr_price - user_cost_basis) / user_cost_basis * 100
         if loss_pct <= -7.0:
-            sell_signals.append(f"🛑 **HARD STOP LOSS HIT:** Stock is down **{loss_pct:.2f}%** from cost basis (7-8% limit exceeded).")
+            hard_sell_signals.append(f"🛑 **HARD STOP LOSS HIT:** Stock is down **{loss_pct:.2f}%** from cost basis (7-8% limit exceeded).")
 
     if below_200d:
-        sell_signals.append("📉 **200-DAY MOVING AVERAGE BREAKDOWN:** Price has fallen below the 200-day SMA (major institutional exit).")
+        hard_sell_signals.append("📉 **200-DAY MOVING AVERAGE BREAKDOWN:** Price has fallen below the 200-day SMA (major institutional exit).")
     elif below_50d and df['Volume_Surge'].iloc[-1]:
-        sell_signals.append("⚠️ **50-DAY SMA BREAKDOWN ON HEAVY VOLUME:** Heavy institutional distribution below the 10-week/50-day line.")
+        hard_sell_signals.append("⚠️ **50-DAY SMA BREAKDOWN ON HEAVY VOLUME:** Heavy institutional distribution below the 10-week/50-day line.")
 
+    # 2. CAUTION WARNINGS (Non-fatal unless combined with technical breakdowns)
     dist_days_count = df['Distribution_Day'].tail(25).sum() if 'Distribution_Day' in df.columns else 0
     if dist_days_count >= 5:
-        sell_signals.append(f"🚨 **HEAVY DISTRIBUTION:** {dist_days_count} distribution days logged in the past 25 sessions.")
+        caution_warnings.append(f"⚠️ **ELEVATED DISTRIBUTION:** {dist_days_count} distribution days logged in past 25 sessions. Monitor 50-day SMA support.")
 
     is_downtrend = False
 
+    # 3. BASE PATTERN IDENTIFICATION
     if off_high_pct > 25.0 and (below_50d or ret_50d < -10.0):
         pattern = "Downtrend / Severe Correction"
         is_downtrend = True
@@ -499,7 +501,8 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
         "Pattern": pattern,
         "Near_52W_High": curr_price >= 0.90 * max_52w,
         "Volume_Surge": bool(df['Volume_Surge'].iloc[-1]) if 'Volume_Surge' in df.columns else False,
-        "Sell_Signals": sell_signals,
+        "Sell_Signals": hard_sell_signals,
+        "Warnings": caution_warnings,
         "Is_Downtrend": is_downtrend,
         "Dist_Days_Count": dist_days_count
     }
@@ -636,24 +639,37 @@ if ticker_input:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 14px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
         # -------------------------------------------------------------
-        # AUTOMATED BUY / SELL / HOLD SIGNAL BANNERS
+        # REVISED AUTOMATED BUY / WATCH / SELL SIGNAL BANNERS
         # -------------------------------------------------------------
         pattern_name = pattern_info["Pattern"]
         sell_signals = pattern_info["Sell_Signals"]
+        warnings = pattern_info["Warnings"]
         is_downtrend = pattern_info["Is_Downtrend"]
-        is_buy_candidate = pattern_name in ["Cup with Handle", "W Bottom / Double Bottom", "Flat Base", "Ascending Base / Near Highs"] and len(sell_signals) == 0
+
+        valid_base_patterns = ["Cup with Handle", "W Bottom / Double Bottom", "Flat Base", "Ascending Base / Near Highs"]
 
         if len(sell_signals) > 0 or is_downtrend:
-            st.error(f"🔴 **SELL / AVOID SIGNAL:** **{ticker_input}** is exhibiting technical breakdown traits or major sell signals.")
+            st.error(f"🔴 **SELL / AVOID SIGNAL:** **{ticker_input}** is exhibiting technical breakdown traits or major sell triggers.")
             with st.expander("🔻 View Active CAN SLIM Sell Catalyst Details", expanded=True):
                 for sig in sell_signals:
                     st.markdown(f"- {sig}")
                 if is_downtrend:
-                    st.markdown(f"- 📉 **Structure in Downside Channel:** Categorized as **{pattern_name}** (>25% off 52W high / trading below key moving averages).")
-        elif is_buy_candidate:
-            st.success(f"🟢 **BUY RECOMMENDATION:** **{ticker_input}** is breaking out or forming an actionable **{pattern_name}** base structure.")
+                    st.markdown(f"- 📉 **Structure in Downside Channel:** Categorized as **{pattern_name}** (>25% off 52W high or below key MAs).")
+
+        elif pattern_name in valid_base_patterns:
+            if pattern_info['Near_52W_High'] and pattern_info['Volume_Surge']:
+                st.success(f"🟢 **BUY SIGNAL / ACTIONABLE BREAKOUT:** **{ticker_input}** is breaking out from a **{pattern_name}** on heavy volume!")
+            else:
+                st.info(f"👀 **WATCH / BASE BUILDING:** **{ticker_input}** is constructing a valid **{pattern_name}** base structure near highs. Monitor for a volume-backed breakout above the pivot point.")
+
         else:
-            st.info(f"⚪ **HOLD / PASS:** **{ticker_input}** is currently in a **{pattern_name}** pattern. Wait for a Cup with Handle or W Bottom setup before opening a position.")
+            st.warning(f"⚪ **HOLD / NEUTRAL:** **{ticker_input}** is currently consolidating in a **{pattern_name}**.")
+
+        # Display Caution Warnings (if no hard sell triggered)
+        if warnings and len(sell_signals) == 0:
+            with st.expander("⚠️ View Operational & Technical Caution Warnings", expanded=False):
+                for w in warnings:
+                    st.markdown(f"- {w}")
 
         # -------------------------------------------------------------
         # CAN SLIM SCORECARD BANNER
