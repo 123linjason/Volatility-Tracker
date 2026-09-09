@@ -234,10 +234,10 @@ def fetch_financial_data(ticker_symbol):
         q_income = ticker.quarterly_incomestmt
         q_combined = q_financials if not q_financials.empty else q_income
         
-        # Extended Earnings Dates
+        # Extended Earnings Dates (pull up to 32 past/future quarters)
         earnings_dates = pd.DataFrame()
         try:
-            ed = ticker.get_earnings_dates(limit=32)
+            ed = ticker.get_earnings_dates(limit=40)
             if ed is not None and not ed.empty:
                 if ed.index.tz is not None:
                     ed.index = ed.index.tz_localize(None)
@@ -355,59 +355,71 @@ def calculate_technicals(df):
 
 def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol=""):
     is_nvda = (ticker_symbol.upper() == "NVDA")
+    today = pd.to_datetime('today').tz_localize(None)
     
-    if q_df is None or q_df.empty:
-        return pd.DataFrame(), "N/A"
+    merged_records = {}
 
-    df_t = q_df.T.copy()
-    df_t.index = pd.to_datetime(df_t.index)
-    df_t = df_t.sort_index(ascending=True) # Ascending order for correct growth metrics
+    # 1. Parse quarterly_financials (4-5 recent quarters for revenue)
+    if q_df is not None and not q_df.empty:
+        df_t = q_df.T.copy()
+        df_t.index = pd.to_datetime(df_t.index)
+        rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
+        eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
+        
+        for dt, row in df_t.iterrows():
+            q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
+            rev = pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan
+            eps = pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
+            
+            merged_records[q_label] = {
+                "Date": dt,
+                "Quarter_Label": q_label,
+                "Revenue": rev,
+                "EPS": eps
+            }
 
-    rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
-    eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
-
-    records = []
-
-    # Filter earnings dates
-    ed_clean = pd.DataFrame()
+    # 2. Extract deep historical EPS from earnings_dates (goes back up to 24-32 quarters)
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
         ed_clean.index = pd.to_datetime(ed_clean.index)
-
-    for dt, row in df_t.iterrows():
-        q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
         
-        revenue = pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan
-        eps = pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
+        # Exclude future unreleased quarters
+        ed_clean = ed_clean[ed_clean.index <= today]
+        
+        for dt, row in ed_clean.iterrows():
+            q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
+            reported_eps = pd.to_numeric(row['Reported EPS'], errors='coerce')
+            
+            if q_label in merged_records:
+                if np.isnan(merged_records[q_label]['EPS']) or merged_records[q_label]['EPS'] is None:
+                    merged_records[q_label]['EPS'] = reported_eps
+            else:
+                merged_records[q_label] = {
+                    "Date": dt,
+                    "Quarter_Label": q_label,
+                    "Revenue": np.nan,
+                    "EPS": reported_eps
+                }
 
-        # Match with closest earnings report date if EPS missing
-        if np.isnan(eps) and not ed_clean.empty:
-            close_dates = ed_clean[abs(ed_clean.index - dt) <= pd.Timedelta(days=45)]
-            if not close_dates.empty:
-                eps = pd.to_numeric(close_dates['Reported EPS'].iloc[0], errors='coerce')
-
-        records.append({
-            "Date": dt,
-            "Quarter_Label": q_label,
-            "Quarter / Date": f"{dt.strftime('%Y-%m-%d')} ({q_label})",
-            "Quarterly Revenue ($)": revenue,
-            "Quarterly EPS ($)": eps
-        })
-
-    summary = pd.DataFrame(records)
-    if summary.empty:
+    if not merged_records:
         return pd.DataFrame(), "N/A"
 
+    # Construct unified dataframe
+    summary = pd.DataFrame(list(merged_records.values()))
     summary = summary.sort_values('Date', ascending=True).reset_index(drop=True)
 
-    # Calculate Growth Rates (YoY = 4 periods back, QoQ = 1 period back)
-    summary['YoY Revenue Growth (%)'] = summary['Quarterly Revenue ($)'].pct_change(4) * 100
-    summary['QoQ EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(1) * 100
-    summary['YoY EPS Growth (%)'] = summary['Quarterly EPS ($)'].pct_change(4) * 100
+    summary['Quarter / Date'] = summary.apply(
+        lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
+    )
+
+    # Calculate YoY & QoQ Growth Across full multi-year history
+    summary['YoY Revenue Growth (%)'] = summary['Revenue'].pct_change(4) * 100
+    summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
+    summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
 
     # Calculate Trailing Twelve Months (TTM)
-    summary['Annual Sales (TTM)'] = summary['Quarterly Revenue ($)'].rolling(window=4, min_periods=1).sum()
-    summary['Annual EPS (TTM)'] = summary['Quarterly EPS ($)'].rolling(window=4, min_periods=1).sum()
+    summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
+    summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
     # Acceleration Triggers
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
@@ -421,7 +433,10 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
         np.where(summary['EPS_Accelerating'], "📈 Accelerating", "🔽 Decelerating")
     )
 
-    # Sort DESCENDING (Most recent quarter at top)
+    summary['Quarterly Revenue ($)'] = summary['Revenue']
+    summary['Quarterly EPS ($)'] = summary['EPS']
+
+    # Sort DESCENDING (Most recent quarter at top), taking up to 24 quarters
     summary_desc = summary.sort_values('Date', ascending=False).head(24)
 
     return summary_desc, latest_accel_q
@@ -736,7 +751,7 @@ if ticker_input:
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS (DEDUPLICATED)
+        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED)
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
