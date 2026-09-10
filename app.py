@@ -313,31 +313,28 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
     if not records:
         return pd.DataFrame(), "N/A"
 
-    # Step 1: Ensure strict CHRONOLOGICAL ASCENDING ORDER before growth calculations
+    # 1. Sort strictly CHRONOLOGICALLY (ASCENDING BY DATE) before calculating pct_change
     summary = pd.DataFrame(records).sort_values('Date', ascending=True).reset_index(drop=True)
 
     summary['Quarter / Date'] = summary.apply(
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
-    # Step 2: Calculate Growth Metrics chronologically
-    # - Quarterly Revenue Growth (%): Same-Quarter Prior-Year (4-quarter lookback)
-    # - QoQ EPS Growth (%): Immediate previous quarter (1-quarter lookback)
-    # - YoY EPS Growth (%): Same-Quarter Prior-Year (4-quarter lookback)
+    # 2. Calculate YoY Growth for Revenue, QoQ EPS, and YoY EPS using 4-quarter lookbacks
     if len(summary) >= 5:
-        summary['Quarterly Revenue Growth (%)'] = summary['Revenue'].pct_change(4) * 100
-        summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
+        summary['Revenue Growth (YoY)'] = summary['Revenue'].pct_change(4) * 100
+        summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100  # Shifted to 4-quarter YoY lookback
         summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
     else:
-        summary['Quarterly Revenue Growth (%)'] = np.nan
+        summary['Revenue Growth (YoY)'] = np.nan
         summary['QoQ EPS Growth (%)'] = np.nan
         summary['YoY EPS Growth (%)'] = np.nan
 
-    # Step 3: Calculate 4-Quarter Rolling TTM Totals
+    # 3. Calculate 4-Quarter Rolling TTM Totals
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
-    # Step 4: Status Indicator Calculations
+    # 4. Status Indicator Calculations
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -352,7 +349,7 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
     summary['Quarterly Revenue ($)'] = summary['Revenue']
     summary['Quarterly EPS ($)'] = summary['EPS']
 
-    # Step 5: Reverse dataframe to DESCENDING ORDER strictly for final rendering/display
+    # 5. Reverse dataframe to DESCENDING ORDER for final table display
     summary_desc = summary.sort_values('Date', ascending=False).reset_index(drop=True)
 
     return summary_desc, latest_accel_q
@@ -785,7 +782,7 @@ if ticker_input and ticker_input != "N/A":
                 display_df = q_summary.copy()
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
-                display_df['Revenue Growth (YoY)'] = display_df['Quarterly Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
+                display_df['Revenue Growth (YoY)'] = display_df['Revenue Growth (YoY)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['Quarterly EPS'] = display_df['Quarterly EPS ($)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
                 display_df['QoQ EPS Growth'] = display_df['QoQ EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['YoY EPS Growth'] = display_df['YoY EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
