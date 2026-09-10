@@ -18,10 +18,8 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Global Layout Tweaks */
     .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
     
-    /* Institutional Metric Cards */
     .metric-card {
         background-color: #1a1e29;
         border: 1px solid #2a2e3d;
@@ -54,7 +52,6 @@ st.markdown("""
     .text-red { color: #f23645; }
     .text-neutral { color: #b2b5be; }
     
-    /* CAN SLIM Scorecard Badges */
     .scorecard-card {
         background: #131722;
         border: 1px solid #2a2e3d;
@@ -72,7 +69,6 @@ st.markdown("""
     .badge-fail { background-color: #f2364522; color: #f23645; border: 1px solid #f23645; font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; display: inline-block; margin-top: 4px; }
     .badge-neutral { background-color: #ff980022; color: #ff9800; border: 1px solid #ff9800; font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; display: inline-block; margin-top: 4px; }
     
-    /* Clean News Container */
     .news-card {
         background-color: #1a1e29;
         border-left: 3px solid #2962ff;
@@ -91,7 +87,6 @@ st.markdown("""
 # ==========================================
 WATCHLIST_OPTIONS = {
     "Custom / Unlisted Ticker (N/A)": "N/A",
-    # Tech & Semiconductors
     "Nvidia (NVDA)": "NVDA",
     "AppLovin (APP)": "APP",
     "Palantir (PLTR)": "PLTR",
@@ -112,8 +107,6 @@ WATCHLIST_OPTIONS = {
     "AerCap Holdings (AER)": "AER",
     "Micron Technology (MU)": "MU",
     "SK Hynix (000660.KS)": "000660.KS",
-    
-    # High-Growth Non-Tech Additions (>30% YoY Growth)
     "Howmet Aerospace (HWM)": "HWM",
     "Axon Enterprise (AXON)": "AXON",
     "CAVA Group (CAVA)": "CAVA",
@@ -125,7 +118,6 @@ WATCHLIST_OPTIONS = {
 }
 
 WATCHLIST_PEERS = {
-    # Tech & Semiconductors
     "NVDA": ["MU", "SMCI", "ALAB", "CRDO", "000660.KS"],
     "APP": ["RDDT", "DUOL", "MDB", "CART"],
     "PLTR": ["MDB", "IOT", "AXON", "ANET"],
@@ -146,8 +138,6 @@ WATCHLIST_PEERS = {
     "AER": ["FIX", "AXON"],
     "MU": ["NVDA", "000660.KS", "ALAB", "CRDO"],
     "000660.KS": ["MU", "NVDA", "ALAB"],
-
-    # Non-Tech High Growth Peers
     "HWM": ["GE", "TDG", "HON", "BA"],
     "AXON": ["MSI", "LDOS", "PLTR", "IOT"],
     "CAVA": ["CMG", "SHAK", "BROS", "WING"],
@@ -161,7 +151,7 @@ WATCHLIST_PEERS = {
 def fetch_online_peers(ticker_symbol):
     try:
         url = f"https://query2.finance.yahoo.com/v6/finance/recommendationsbyticker/{ticker_symbol.upper()}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             result = res.json().get('finance', {}).get('result', [])
@@ -241,9 +231,10 @@ def fetch_financial_data(ticker_symbol):
         df_price = df_price.join(sp500['Close'].rename('SP500_Close'), how='left')
         df_price['SP500_Close'] = df_price['SP500_Close'].ffill().bfill()
         
-        q_financials = ticker.quarterly_financials
-        q_income = ticker.quarterly_incomestmt
-        q_combined = q_financials if not q_financials.empty else q_income
+        # Pull income statement first for reliable Revenue and EPS
+        q_income = ticker.quarterly_income_stmt
+        if q_income is None or q_income.empty:
+            q_income = ticker.quarterly_financials
         
         earnings_dates = pd.DataFrame()
         try:
@@ -274,7 +265,7 @@ def fetch_financial_data(ticker_symbol):
 
         return {
             "price_data": df_price,
-            "q_financials": q_combined,
+            "q_financials": q_income,
             "earnings_dates": earnings_dates,
             "info": info,
             "news": parsed_news
@@ -365,52 +356,32 @@ def calculate_technicals(df):
 
 def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol=""):
     is_nvda = (ticker_symbol.upper() == "NVDA")
-    today = pd.to_datetime('today').tz_localize(None)
-    
-    merged_records = {}
+    merged_records = []
 
     if q_df is not None and not q_df.empty:
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
+        
+        # Locate Revenue and EPS fields cleanly
         rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
-        eps_col = [c for c in df_t.columns if 'Normalized EPS' in str(c) or 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
+        eps_col = [c for c in df_t.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c) or 'Normalized EPS' in str(c)]
         
         for dt, row in df_t.iterrows():
             q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
             rev = pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan
             eps = pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
             
-            merged_records[q_label] = {
+            merged_records.append({
                 "Date": dt,
                 "Quarter_Label": q_label,
                 "Revenue": rev,
                 "EPS": eps
-            }
-
-    if ed_df is not None and not ed_df.empty:
-        ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
-        ed_clean.index = pd.to_datetime(ed_clean.index)
-        ed_clean = ed_clean[ed_clean.index <= today]
-        
-        for dt, row in ed_clean.iterrows():
-            q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
-            reported_eps = pd.to_numeric(row['Reported EPS'], errors='coerce')
-            
-            if q_label in merged_records:
-                if np.isnan(merged_records[q_label]['EPS']) or merged_records[q_label]['EPS'] is None:
-                    merged_records[q_label]['EPS'] = reported_eps
-            else:
-                merged_records[q_label] = {
-                    "Date": dt,
-                    "Quarter_Label": q_label,
-                    "Revenue": np.nan,
-                    "EPS": reported_eps
-                }
+            })
 
     if not merged_records:
         return pd.DataFrame(), "N/A"
 
-    summary = pd.DataFrame(list(merged_records.values()))
+    summary = pd.DataFrame(merged_records)
     summary = summary.sort_values('Date', ascending=True).reset_index(drop=True)
 
     summary['Quarter / Date'] = summary.apply(
@@ -437,7 +408,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     summary['Quarterly Revenue ($)'] = summary['Revenue']
     summary['Quarterly EPS ($)'] = summary['EPS']
 
-    summary_desc = summary.sort_values('Date', ascending=False).head(24)
+    summary_desc = summary.sort_values('Date', ascending=False).reset_index(drop=True)
 
     return summary_desc, latest_accel_q
 
@@ -568,7 +539,6 @@ def render_technical_chart(df_price):
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
-# State Initialization
 if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "NVDA"
 if "peers_input_box" not in st.session_state:
@@ -591,7 +561,6 @@ def update_from_manual():
         st.session_state["ticker_search_input"] = ticker
         st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
         
-        # Reset selectbox to "Custom / Unlisted Ticker (N/A)" if not in default list
         found_key = None
         for name, sym in WATCHLIST_OPTIONS.items():
             if sym == ticker:
@@ -604,7 +573,6 @@ def update_from_manual():
 
 current_ticker = st.session_state["selected_ticker"]
 
-# Determine Dropdown Index
 dropdown_default_idx = 0
 for i, (label, symbol) in enumerate(WATCHLIST_OPTIONS.items()):
     if symbol == current_ticker:
@@ -654,9 +622,6 @@ if ticker_input and ticker_input != "N/A":
         )
         pattern_info = detect_chart_patterns_and_sell_signals(df_price)
 
-        # -------------------------------------------------------------
-        # TOP FINANCIAL HEADER METRICS
-        # -------------------------------------------------------------
         latest_price = df_price['Close'].iloc[-1]
         prev_price = df_price['Close'].iloc[-2]
         chg = ((latest_price - prev_price) / prev_price) * 100
@@ -679,9 +644,6 @@ if ticker_input and ticker_input != "N/A":
         with c5:
             st.markdown(f"""<div class="metric-card"><div class="metric-title">Chart Base Pattern</div><div class="metric-value" style="font-size: 14px;">{pattern_info['Pattern']}</div><div class="metric-sub text-neutral">Accel Turning: {accel_start_q}</div></div>""", unsafe_allow_html=True)
 
-        # -------------------------------------------------------------
-        # AUTOMATED BUY / WATCH / SELL SIGNAL BANNERS
-        # -------------------------------------------------------------
         pattern_name = pattern_info["Pattern"]
         sell_signals = pattern_info["Sell_Signals"]
         warnings = pattern_info["Warnings"]
@@ -706,15 +668,11 @@ if ticker_input and ticker_input != "N/A":
         else:
             st.warning(f"⚪ **HOLD / NEUTRAL:** **{ticker_input}** is currently consolidating in a **{pattern_name}**.")
 
-        # Display Caution Warnings
         if warnings and len(sell_signals) == 0:
             with st.expander("⚠️ View Operational & Technical Caution Warnings", expanded=False):
                 for w in warnings:
                     st.markdown(f"- {w}")
 
-        # -------------------------------------------------------------
-        # CAN SLIM SCORECARD BANNER
-        # -------------------------------------------------------------
         st.markdown("### 🏆 CAN SLIM Quantitative Scorecard")
         sc1, sc2, sc3, sc4, sc5, sc6, sc7 = st.columns(7)
         
@@ -739,20 +697,15 @@ if ticker_input and ticker_input != "N/A":
 
         st.markdown("---")
 
-        # -------------------------------------------------------------
-        # ANALYTICS TABS
-        # -------------------------------------------------------------
         tab_tech, tab_fund, tab_peers = st.tabs([
             "📊 Technical Charting & Relative Strength",
-            "📑 Extended Quarterly Fundamentals (24-Qtr) & Adjustments",
+            "📑 Extended Quarterly Fundamentals & Adjustments",
             "🚀 Institutional Trends, Peer Group & News Intelligence"
         ])
 
-        # TAB 1: TECHNICALS
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED)
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
@@ -781,7 +734,6 @@ if ticker_input and ticker_input != "N/A":
             one_time_df = fetch_one_time_expenses(ticker_input)
             st.dataframe(one_time_df, use_container_width=True)
 
-        # TAB 3: INSTITUTIONAL, PEERS & NEWS INTELLIGENCE
         with tab_peers:
             col_p1, col_p2 = st.columns([1.1, 0.9])
             
