@@ -90,6 +90,7 @@ st.markdown("""
 # 2. WATCHLIST MAPPING & PEER DISCOVERY
 # ==========================================
 WATCHLIST_OPTIONS = {
+    "Custom / Unlisted Ticker (N/A)": "N/A",
     # Tech & Semiconductors
     "Nvidia (NVDA)": "NVDA",
     "AppLovin (APP)": "APP",
@@ -368,7 +369,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     
     merged_records = {}
 
-    # 1. Parse quarterly_financials (4-5 recent quarters for revenue)
     if q_df is not None and not q_df.empty:
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
@@ -387,12 +387,9 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
                 "EPS": eps
             }
 
-    # 2. Extract deep historical EPS from earnings_dates
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
         ed_clean.index = pd.to_datetime(ed_clean.index)
-        
-        # Exclude future unreleased quarters
         ed_clean = ed_clean[ed_clean.index <= today]
         
         for dt, row in ed_clean.iterrows():
@@ -413,7 +410,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     if not merged_records:
         return pd.DataFrame(), "N/A"
 
-    # Construct unified dataframe
     summary = pd.DataFrame(list(merged_records.values()))
     summary = summary.sort_values('Date', ascending=True).reset_index(drop=True)
 
@@ -421,15 +417,12 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
-    # Calculate EPS Growth Across full multi-year history
     summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
     summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
 
-    # Calculate Trailing Twelve Months (TTM)
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
-    # Acceleration Triggers
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -444,7 +437,6 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     summary['Quarterly Revenue ($)'] = summary['Revenue']
     summary['Quarterly EPS ($)'] = summary['EPS']
 
-    # Sort DESCENDING (Most recent quarter at top), taking up to 24 quarters
     summary_desc = summary.sort_values('Date', ascending=False).head(24)
 
     return summary_desc, latest_accel_q
@@ -452,7 +444,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
 # ==========================================
 # 6. PATTERN & SELL ENGINE
 # ==========================================
-def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
+def detect_chart_patterns_and_sell_signals(df):
     if df is None or len(df) < 60:
         return {
             "Pattern": "Insufficient Data",
@@ -503,25 +495,17 @@ def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     hard_sell_signals = []
     caution_warnings = []
 
-    # 1. HARD SELL RULES
-    if user_cost_basis and user_cost_basis > 0:
-        loss_pct = (curr_price - user_cost_basis) / user_cost_basis * 100
-        if loss_pct <= -7.0:
-            hard_sell_signals.append(f"🛑 **HARD STOP LOSS HIT:** Stock is down **{loss_pct:.2f}%** from cost basis (7-8% limit exceeded).")
-
     if below_200d:
         hard_sell_signals.append("📉 **200-DAY MOVING AVERAGE BREAKDOWN:** Price has fallen below the 200-day SMA (major institutional exit).")
     elif below_50d and df['Volume_Surge'].iloc[-1]:
         hard_sell_signals.append("⚠️ **50-DAY SMA BREAKDOWN ON HEAVY VOLUME:** Heavy institutional distribution below the 10-week/50-day line.")
 
-    # 2. CAUTION WARNINGS
     dist_days_count = df['Distribution_Day'].tail(25).sum() if 'Distribution_Day' in df.columns else 0
     if dist_days_count >= 5:
         caution_warnings.append(f"⚠️ **ELEVATED DISTRIBUTION:** {dist_days_count} distribution days logged in past 25 sessions. Monitor 50-day SMA support.")
 
     is_downtrend = False
 
-    # 3. BASE PATTERN IDENTIFICATION
     if off_high_pct > 25.0 and (below_50d or ret_50d < -10.0):
         pattern = "Downtrend / Severe Correction"
         is_downtrend = True
@@ -584,24 +568,43 @@ def render_technical_chart(df_price):
 # ==========================================
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
+# State Initialization
 if "selected_ticker" not in st.session_state:
     st.session_state["selected_ticker"] = "NVDA"
 if "peers_input_box" not in st.session_state:
     st.session_state["peers_input_box"] = get_watchlist_peers_string("NVDA")
+if "ticker_search_input" not in st.session_state:
+    st.session_state["ticker_search_input"] = "NVDA"
 
 def update_from_dropdown():
     selected_name = st.session_state["watchlist_selector"]
     ticker = WATCHLIST_OPTIONS[selected_name]
-    st.session_state["selected_ticker"] = ticker
-    st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
+    if ticker != "N/A":
+        st.session_state["selected_ticker"] = ticker
+        st.session_state["ticker_search_input"] = ticker
+        st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
 
 def update_from_manual():
     ticker = st.session_state["manual_input"].upper().strip()
     if ticker:
         st.session_state["selected_ticker"] = ticker
+        st.session_state["ticker_search_input"] = ticker
         st.session_state["peers_input_box"] = get_watchlist_peers_string(ticker)
+        
+        # Reset selectbox to "Custom / Unlisted Ticker (N/A)" if not in default list
+        found_key = None
+        for name, sym in WATCHLIST_OPTIONS.items():
+            if sym == ticker:
+                found_key = name
+                break
+        if found_key:
+            st.session_state["watchlist_selector"] = found_key
+        else:
+            st.session_state["watchlist_selector"] = "Custom / Unlisted Ticker (N/A)"
 
 current_ticker = st.session_state["selected_ticker"]
+
+# Determine Dropdown Index
 dropdown_default_idx = 0
 for i, (label, symbol) in enumerate(WATCHLIST_OPTIONS.items()):
     if symbol == current_ticker:
@@ -621,7 +624,7 @@ with st.sidebar:
     
     st.text_input(
         "Or Enter Custom Ticker",
-        value=current_ticker,
+        value=st.session_state["ticker_search_input"],
         key="manual_input",
         on_change=update_from_manual
     )
@@ -630,21 +633,11 @@ with st.sidebar:
         "Auto-Populated Peer Group",
         key="peers_input_box"
     )
-    
-    st.markdown("---")
-    st.subheader("🎯 Position & Sell Diagnostics")
-    user_cost_basis = st.number_input(
-        "Your Average Purchase Price ($)",
-        min_value=0.0,
-        value=0.0,
-        step=1.0,
-        help="Enter your purchase cost basis to run automated CAN SLIM 7-8% stop loss and sell discipline checks."
-    )
 
 ticker_input = st.session_state["selected_ticker"]
 peer_input = st.session_state["peers_input_box"].upper()
 
-if ticker_input:
+if ticker_input and ticker_input != "N/A":
     with st.spinner(f"Retrieving analytics for {ticker_input}..."):
         data, err = fetch_financial_data(ticker_input)
 
@@ -659,7 +652,7 @@ if ticker_input:
             info, 
             ticker_input
         )
-        pattern_info = detect_chart_patterns_and_sell_signals(df_price, user_cost_basis)
+        pattern_info = detect_chart_patterns_and_sell_signals(df_price)
 
         # -------------------------------------------------------------
         # TOP FINANCIAL HEADER METRICS
@@ -820,3 +813,5 @@ if ticker_input:
                     """, unsafe_allow_html=True)
             else:
                 st.info("No recent corporate news items found for this ticker.")
+else:
+    st.info("Enter a valid ticker symbol in the custom text input or select a stock from the watchlist dropdown to display analytics.")
