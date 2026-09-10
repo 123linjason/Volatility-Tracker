@@ -327,13 +327,12 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
-    # Calculate QoQ Growth
-    summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
-
-    # Calculate 4-Quarter Lookback YoY Growth across up to 36 quarters
+    # UPDATED: Current quarter vs. Same Quarter Prior Year (4-quarter lookback)
     if len(summary) >= 5:
+        summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
         summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
     else:
+        summary['QoQ EPS Growth (%)'] = np.nan
         summary['YoY EPS Growth (%)'] = np.nan
 
     # 4-Quarter Rolling TTM Totals
@@ -783,7 +782,7 @@ if ticker_input and ticker_input != "N/A":
         with tab_fund:
             if not q_summary.empty:
                 st.markdown(f"### Extended Quarterly Fundamental History ({len(q_summary)} Quarters Loaded)")
-                st.caption("Displays Quarterly Sales, Quarterly EPS, YoY/QoQ EPS Growth, and Trailing Twelve Months (TTM) Totals derived from SEC 10-Q filings (Most Recent at Top).")
+                st.caption("Displays Quarterly Sales, Quarterly EPS, Same-Quarter Prior-Year EPS Growth, and Trailing Twelve Months (TTM) Totals derived from SEC 10-Q filings (Most Recent at Top).")
                 
                 display_df = q_summary.copy()
                 
