@@ -211,7 +211,7 @@ def get_fiscal_quarter_info(dt, is_nvda=False):
     return f"Q{q_num}", fy, f"Q{q_num} FY{fy}"
 
 # ==========================================
-# 4. SEC EDGAR 36-QUARTER INGESTION ENGINE
+# 4. SEC EDGAR INGESTION & FUNDAMENTALS ENGINE
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_36_quarters_sec(ticker_symbol):
@@ -256,7 +256,6 @@ def fetch_36_quarters_sec(ticker_symbol):
         if not rev_units or not eps_units:
             return pd.DataFrame()
 
-        # Include 10-Q and 10-K filings to extract full 4 quarters
         rev_records = [
             {'Date': pd.to_datetime(item['end']), 'Revenue': item['val'], 'form': item.get('form'), 'frame': item.get('frame', '')}
             for item in rev_units if item.get('form') in ['10-Q', '10-K'] and 'end' in item
@@ -327,59 +326,55 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Q_Code']} {r['FY']})", axis=1
     )
 
-    # Calculate exact YoY metrics by comparing current quarter against the exact same quarter code from prior year (Q1 vs Q1, Q2 vs Q2, etc.)
-    revenue_yoy = []
-    eps_qoq_yoy = []
-    eps_yoy = []
-
     lookup_map = {}
     for idx, row in summary.iterrows():
         key = (row['Q_Code'], row['FY'])
         lookup_map[key] = row
 
+    revenue_yoy = []
+    eps_qoq_seq = []
+    eps_yoy = []
+
     for idx, row in summary.iterrows():
         curr_q = row['Q_Code']
         curr_fy = row['FY']
-        prev_year_key = (curr_q, curr_fy - 1)
-
-        if prev_year_key in lookup_map:
-            prev_row = lookup_map[prev_year_key]
-            
-            # Revenue YoY Growth
-            if pd.notnull(prev_row['Revenue']) and prev_row['Revenue'] != 0:
-                rev_growth = ((row['Revenue'] - prev_row['Revenue']) / abs(prev_row['Revenue'])) * 100
-            else:
-                rev_growth = np.nan
-                
-            # EPS YoY Growth (same period last year)
-            if pd.notnull(prev_row['EPS']) and prev_row['EPS'] != 0:
-                eps_growth = ((row['EPS'] - prev_row['EPS']) / abs(prev_row['EPS'])) * 100
-            else:
-                eps_growth = np.nan
-        else:
-            rev_growth = np.nan
-            eps_growth = np.nan
-
-        # QoQ EPS Growth (sequential previous quarter)
+        
+        # Sequential Previous Quarter (QoQ)
         prev_seq_row = summary.iloc[idx - 1] if idx > 0 else None
         if prev_seq_row is not None and pd.notnull(prev_seq_row['EPS']) and prev_seq_row['EPS'] != 0:
             qoq_growth = ((row['EPS'] - prev_seq_row['EPS']) / abs(prev_seq_row['EPS'])) * 100
         else:
             qoq_growth = np.nan
 
+        # Same Quarter Prior Year (YoY)
+        prev_year_key = (curr_q, curr_fy - 1)
+        if prev_year_key in lookup_map:
+            prev_year_row = lookup_map[prev_year_key]
+            
+            if pd.notnull(prev_year_row['Revenue']) and prev_year_row['Revenue'] != 0:
+                rev_growth = ((row['Revenue'] - prev_year_row['Revenue']) / abs(prev_year_row['Revenue'])) * 100
+            else:
+                rev_growth = np.nan
+                
+            if pd.notnull(prev_year_row['EPS']) and prev_year_row['EPS'] != 0:
+                eps_yoy_growth = ((row['EPS'] - prev_year_row['EPS']) / abs(prev_year_row['EPS'])) * 100
+            else:
+                eps_yoy_growth = np.nan
+        else:
+            rev_growth = np.nan
+            eps_yoy_growth = np.nan
+
         revenue_yoy.append(rev_growth)
-        eps_qoq_yoy.append(qoq_growth)
-        eps_yoy.append(eps_growth)
+        eps_qoq_seq.append(qoq_growth)
+        eps_yoy.append(eps_yoy_growth)
 
     summary['Revenue Growth (YoY)'] = revenue_yoy
-    summary['QoQ EPS Growth (%)'] = eps_qoq_yoy
+    summary['QoQ EPS Growth (%)'] = eps_qoq_seq
     summary['YoY EPS Growth (%)'] = eps_yoy
 
-    # Calculate 4-Quarter Rolling TTM Totals
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
-    # Status Indicator Calculations
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -656,11 +651,11 @@ def render_technical_chart(df_price):
 st.title("📈 CAN SLIM Equity Analytics Platform")
 
 if "selected_ticker" not in st.session_state:
-    st.session_state["selected_ticker"] = "DUOL"
+    st.session_state["selected_ticker"] = "NVDA"
 if "peers_input_box" not in st.session_state:
-    st.session_state["peers_input_box"] = get_watchlist_peers_string("DUOL")
+    st.session_state["peers_input_box"] = get_watchlist_peers_string("NVDA")
 if "ticker_search_input" not in st.session_state:
-    st.session_state["ticker_search_input"] = "DUOL"
+    st.session_state["ticker_search_input"] = "NVDA"
 
 def update_from_dropdown():
     selected_name = st.session_state["watchlist_selector"]
