@@ -185,7 +185,7 @@ def format_large_number(num):
 
 def format_pct(num):
     if num is None or np.isnan(num):
-        return "N/A"
+        return "—"
     return f"{num:+.2f}%"
 
 def get_fiscal_quarter_label(dt, is_nvda=False):
@@ -231,7 +231,7 @@ def fetch_financial_data(ticker_symbol):
         df_price = df_price.join(sp500['Close'].rename('SP500_Close'), how='left')
         df_price['SP500_Close'] = df_price['SP500_Close'].ffill().bfill()
         
-        # Pull income statement first for reliable Revenue and EPS
+        # Pull income statement
         q_income = ticker.quarterly_income_stmt
         if q_income is None or q_income.empty:
             q_income = ticker.quarterly_financials
@@ -293,8 +293,8 @@ def fetch_peer_benchmark(main_ticker, peer_list):
             comparison_data.append({
                 "Ticker": symbol,
                 "Company Name": info.get('shortName', symbol),
-                "Qtr Sales Growth (YoY)": format_pct(q_rev_growth * 100) if pd.notnull(q_rev_growth) else "N/A",
-                "Qtr EPS Growth (YoY)": format_pct(q_eps_growth * 100) if pd.notnull(q_eps_growth) else "N/A",
+                "Qtr Sales Growth (YoY)": format_pct(q_rev_growth * 100) if pd.notnull(q_rev_growth) else "—",
+                "Qtr EPS Growth (YoY)": format_pct(q_eps_growth * 100) if pd.notnull(q_eps_growth) else "—",
                 "Gross Margin": f"{gross_margin*100:.2f}%" if pd.notnull(gross_margin) else "N/A",
                 "Operating Margin": f"{op_margin*100:.2f}%" if pd.notnull(op_margin) else "N/A",
                 "Return on Equity": f"{roe*100:.2f}%" if pd.notnull(roe) else "N/A",
@@ -362,14 +362,26 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
         df_t = q_df.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
         
-        # Locate Revenue and EPS fields cleanly
-        rev_col = [c for c in df_t.columns if 'Total Revenue' in str(c) or 'Revenue' in str(c)]
-        eps_col = [c for c in df_t.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c) or 'Normalized EPS' in str(c)]
+        # 1. Filter out Cost of Revenue / COGS items
+        rev_cols = [
+            c for c in df_t.columns 
+            if 'Total Revenue' in str(c) or (('Revenue' in str(c) or 'Operating Revenue' in str(c)) and 'Cost' not in str(c))
+        ]
+        
+        # 2. Extract Diluted EPS
+        eps_cols = [
+            c for c in df_t.columns 
+            if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c) or 'Normalized EPS' in str(c)
+        ]
+        
+        selected_rev_col = rev_cols[0] if rev_cols else None
+        selected_eps_col = eps_cols[0] if eps_cols else None
         
         for dt, row in df_t.iterrows():
             q_label = get_fiscal_quarter_label(dt, is_nvda=is_nvda)
-            rev = pd.to_numeric(row[rev_col[0]], errors='coerce') if rev_col else np.nan
-            eps = pd.to_numeric(row[eps_col[0]], errors='coerce') if eps_col else np.nan
+            
+            rev = pd.to_numeric(row[selected_rev_col], errors='coerce') if selected_rev_col else np.nan
+            eps = pd.to_numeric(row[selected_eps_col], errors='coerce') if selected_eps_col else np.nan
             
             merged_records.append({
                 "Date": dt,
@@ -381,19 +393,26 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     if not merged_records:
         return pd.DataFrame(), "N/A"
 
-    summary = pd.DataFrame(merged_records)
-    summary = summary.sort_values('Date', ascending=True).reset_index(drop=True)
+    # Sort chronologically for growth percentage and TTM calculations
+    summary = pd.DataFrame(merged_records).sort_values('Date', ascending=True).reset_index(drop=True)
 
     summary['Quarter / Date'] = summary.apply(
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
+    # Calculate QoQ and YoY Growth
     summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(1) * 100
-    summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
+    
+    if len(summary) >= 5:
+        summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
+    else:
+        summary['YoY EPS Growth (%)'] = np.nan
 
+    # Calculate TTM Rolling Sums
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
+    # Acceleration logic
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -408,6 +427,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     summary['Quarterly Revenue ($)'] = summary['Revenue']
     summary['Quarterly EPS ($)'] = summary['EPS']
 
+    # Sort back descending (most recent at top)
     summary_desc = summary.sort_values('Date', ascending=False).reset_index(drop=True)
 
     return summary_desc, latest_accel_q
