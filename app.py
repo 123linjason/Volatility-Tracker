@@ -90,6 +90,7 @@ st.markdown("""
 # 2. WATCHLIST MAPPING & PEER DISCOVERY
 # ==========================================
 WATCHLIST_OPTIONS = {
+    # Tech & Semiconductors
     "Nvidia (NVDA)": "NVDA",
     "AppLovin (APP)": "APP",
     "Palantir (PLTR)": "PLTR",
@@ -101,8 +102,6 @@ WATCHLIST_OPTIONS = {
     "MercadoLibre (MELI)": "MELI",
     "Super Micro Computer (SMCI)": "SMCI",
     "Samsara (IOT)": "IOT",
-    "Axon Enterprise (AXON)": "AXON",
-    "Comfort Systems (FIX)": "FIX",
     "Arista Networks (ANET)": "ANET",
     "The Vita Coco Company (COCO)": "COCO",
     "MongoDB (MDB)": "MDB",
@@ -111,10 +110,21 @@ WATCHLIST_OPTIONS = {
     "Maplebear / Instacart (CART)": "CART",
     "AerCap Holdings (AER)": "AER",
     "Micron Technology (MU)": "MU",
-    "SK Hynix (000660.KS)": "000660.KS"
+    "SK Hynix (000660.KS)": "000660.KS",
+    
+    # High-Growth Non-Tech Additions (>30% YoY Growth)
+    "Howmet Aerospace (HWM)": "HWM",
+    "Axon Enterprise (AXON)": "AXON",
+    "CAVA Group (CAVA)": "CAVA",
+    "On Holding (ONON)": "ONON",
+    "Deckers Outdoor (DECK)": "DECK",
+    "Intuitive Surgical (ISRG)": "ISRG",
+    "Robinhood Markets (HOOD)": "HOOD",
+    "KKR & Co. (KKR)": "KKR"
 }
 
 WATCHLIST_PEERS = {
+    # Tech & Semiconductors
     "NVDA": ["MU", "SMCI", "ALAB", "CRDO", "000660.KS"],
     "APP": ["RDDT", "DUOL", "MDB", "CART"],
     "PLTR": ["MDB", "IOT", "AXON", "ANET"],
@@ -123,11 +133,9 @@ WATCHLIST_PEERS = {
     "ALAB": ["CRDO", "NVDA", "CLS", "MU"],
     "RDDT": ["APP", "DUOL", "CART", "MDB"],
     "DUOL": ["APP", "RDDT", "CART"],
-    "MELI": ["CART", "DUOL", "CELH"],
+    "MELI": ["CART", "DUOL", "CELH", "CAVA"],
     "SMCI": ["CLS", "NVDA", "ANET", "CRDO"],
     "IOT": ["PLTR", "AXON", "FIX", "ANET"],
-    "AXON": ["PLTR", "IOT", "FIX"],
-    "FIX": ["CLS", "AXON", "ANET"],
     "ANET": ["CRDO", "SMCI", "PLTR", "FIX"],
     "COCO": ["CELH", "MELI"],
     "MDB": ["PLTR", "APP", "RDDT", "IOT"],
@@ -136,7 +144,17 @@ WATCHLIST_PEERS = {
     "CART": ["APP", "DUOL", "MELI", "RDDT"],
     "AER": ["FIX", "AXON"],
     "MU": ["NVDA", "000660.KS", "ALAB", "CRDO"],
-    "000660.KS": ["MU", "NVDA", "ALAB"]
+    "000660.KS": ["MU", "NVDA", "ALAB"],
+
+    # Non-Tech High Growth Peers
+    "HWM": ["GE", "TDG", "HON", "BA"],
+    "AXON": ["MSI", "LDOS", "PLTR", "IOT"],
+    "CAVA": ["CMG", "SHAK", "BROS", "WING"],
+    "ONON": ["DECK", "NKE", "BIRK", "CROX"],
+    "DECK": ["ONON", "CROX", "SKX", "NKE"],
+    "ISRG": ["SYK", "MDT", "BSX", "EW"],
+    "HOOD": ["IBKR", "SCHW", "COIN", "PLTR"],
+    "KKR": ["BX", "APO", "ARES", "BLK"]
 }
 
 def fetch_online_peers(ticker_symbol):
@@ -369,7 +387,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
                 "EPS": eps
             }
 
-    # 2. Extract deep historical EPS from earnings_dates (goes back up to 24-32 quarters)
+    # 2. Extract deep historical EPS from earnings_dates
     if ed_df is not None and not ed_df.empty:
         ed_clean = ed_df.dropna(subset=['Reported EPS']).copy()
         ed_clean.index = pd.to_datetime(ed_clean.index)
@@ -432,7 +450,7 @@ def process_quarterly_fundamentals_24q(q_df, ed_df, info_dict, ticker_symbol="")
     return summary_desc, latest_accel_q
 
 # ==========================================
-# 6. REVISED PATTERN & SELL ENGINE
+# 6. PATTERN & SELL ENGINE
 # ==========================================
 def detect_chart_patterns_and_sell_signals(df, user_cost_basis=None):
     if df is None or len(df) < 60:
@@ -695,7 +713,7 @@ if ticker_input:
         else:
             st.warning(f"⚪ **HOLD / NEUTRAL:** **{ticker_input}** is currently consolidating in a **{pattern_name}**.")
 
-        # Display Caution Warnings (if no hard sell triggered)
+        # Display Caution Warnings
         if warnings and len(sell_signals) == 0:
             with st.expander("⚠️ View Operational & Technical Caution Warnings", expanded=False):
                 for w in warnings:
@@ -741,7 +759,7 @@ if ticker_input:
         with tab_tech:
             render_technical_chart(df_price)
 
-        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED - REVENUE YOY REMOVED)
+        # TAB 2: FUNDAMENTALS (24 QUARTERS DEDUPLICATED)
         with tab_fund:
             if not q_summary.empty:
                 st.markdown("### Extended Quarterly Fundamental History")
