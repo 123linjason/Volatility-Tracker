@@ -332,21 +332,13 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
         lookup_map[key] = row
 
     revenue_yoy = []
-    eps_qoq_seq = []
-    eps_yoy = []
+    eps_yoy_list = []
 
     for idx, row in summary.iterrows():
         curr_q = row['Q_Code']
         curr_fy = row['FY']
         
-        # Sequential Previous Quarter (QoQ)
-        prev_seq_row = summary.iloc[idx - 1] if idx > 0 else None
-        if prev_seq_row is not None and pd.notnull(prev_seq_row['EPS']) and prev_seq_row['EPS'] != 0:
-            qoq_growth = ((row['EPS'] - prev_seq_row['EPS']) / abs(prev_seq_row['EPS'])) * 100
-        else:
-            qoq_growth = np.nan
-
-        # Same Quarter Prior Year (YoY)
+        # Compare current quarter against same quarter from previous year (FY - 1)
         prev_year_key = (curr_q, curr_fy - 1)
         if prev_year_key in lookup_map:
             prev_year_row = lookup_map[prev_year_key]
@@ -365,12 +357,11 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
             eps_yoy_growth = np.nan
 
         revenue_yoy.append(rev_growth)
-        eps_qoq_seq.append(qoq_growth)
-        eps_yoy.append(eps_yoy_growth)
+        eps_yoy_list.append(eps_yoy_growth)
 
     summary['Revenue Growth (YoY)'] = revenue_yoy
-    summary['QoQ EPS Growth (%)'] = eps_qoq_seq
-    summary['YoY EPS Growth (%)'] = eps_yoy
+    summary['QoQ EPS Growth (%)'] = eps_yoy_list  # Now calculates same quarter vs prior year
+    summary['YoY EPS Growth (%)'] = eps_yoy_list
 
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
