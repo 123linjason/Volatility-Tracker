@@ -217,7 +217,6 @@ def fetch_36_quarters_sec(ticker_symbol):
     headers = {'User-Agent': 'QuantitativeResearch AnalyticsApp/1.0 (contact@analytics.com)'}
     
     try:
-        # Step 1: Map ticker symbol to SEC CIK Number
         cik_res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=10)
         if cik_res.status_code != 200:
             return pd.DataFrame()
@@ -232,7 +231,6 @@ def fetch_36_quarters_sec(ticker_symbol):
         if not cik:
             return pd.DataFrame()
 
-        # Step 2: Query SEC Company Facts API
         facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
         res = requests.get(facts_url, headers=headers, timeout=10)
         if res.status_code != 200:
@@ -240,7 +238,6 @@ def fetch_36_quarters_sec(ticker_symbol):
             
         us_gaap = res.json().get('facts', {}).get('us-gaap', {})
         
-        # Step 3: Extract Revenue
         rev_units = []
         for tag in ['Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet']:
             if tag in us_gaap:
@@ -248,7 +245,6 @@ def fetch_36_quarters_sec(ticker_symbol):
                 if rev_units:
                     break
 
-        # Step 4: Extract Diluted EPS
         eps_units = []
         for tag in ['EarningsPerShareDiluted', 'EarningsPerShareBasicAndDiluted']:
             if tag in us_gaap:
@@ -259,7 +255,6 @@ def fetch_36_quarters_sec(ticker_symbol):
         if not rev_units or not eps_units:
             return pd.DataFrame()
 
-        # Step 5: Filter 10-Q (Quarterly) filings
         rev_records = [
             {'Date': pd.to_datetime(item['end']), 'Revenue': item['val']}
             for item in rev_units if item.get('form') == '10-Q' and 'end' in item
@@ -275,7 +270,6 @@ def fetch_36_quarters_sec(ticker_symbol):
         merged = pd.merge(df_rev, df_eps, on='Date', how='inner')
         merged = merged.sort_values('Date', ascending=True).reset_index(drop=True)
         
-        # Keep up to 36 quarters
         return merged.tail(36).reset_index(drop=True)
 
     except Exception:
@@ -287,7 +281,6 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
 
     records = []
 
-    # Use SEC data if available
     if not df_sec.empty and len(df_sec) >= 6:
         for _, row in df_sec.iterrows():
             dt = row['Date']
@@ -297,7 +290,6 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
                 "Revenue": float(row['Revenue']),
                 "EPS": float(row['EPS'])
             })
-    # Fallback to yfinance if SEC data is empty or short
     elif yf_q_financials is not None and not yf_q_financials.empty:
         df_t = yf_q_financials.T.copy()
         df_t.index = pd.to_datetime(df_t.index)
@@ -327,19 +319,20 @@ def process_36q_fundamentals(ticker_symbol, yf_q_financials=None):
         lambda r: f"{r['Date'].strftime('%Y-%m-%d')} ({r['Quarter_Label']})", axis=1
     )
 
-    # UPDATED: Current quarter vs. Same Quarter Prior Year (4-quarter lookback)
+    # Growth Metrics (Same-Quarter Prior-Year 4-quarter lookback)
     if len(summary) >= 5:
         summary['QoQ EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
         summary['YoY EPS Growth (%)'] = summary['EPS'].pct_change(4) * 100
+        summary['Quarterly Revenue Growth (%)'] = summary['Revenue'].pct_change(4) * 100
     else:
         summary['QoQ EPS Growth (%)'] = np.nan
         summary['YoY EPS Growth (%)'] = np.nan
+        summary['Quarterly Revenue Growth (%)'] = np.nan
 
     # 4-Quarter Rolling TTM Totals
     summary['Annual Sales (TTM)'] = summary['Revenue'].rolling(window=4, min_periods=1).sum()
     summary['Annual EPS (TTM)'] = summary['EPS'].rolling(window=4, min_periods=1).sum()
 
-    # Acceleration logic across multi-year timeline
     summary['EPS_Accelerating'] = summary['YoY EPS Growth (%)'] > summary['YoY EPS Growth (%)'].shift(1)
     summary['Acceleration_Start'] = (summary['EPS_Accelerating']) & (~summary['EPS_Accelerating'].shift(1).fillna(False))
 
@@ -691,7 +684,6 @@ if ticker_input and ticker_input != "N/A":
         df_price = calculate_technicals(data['price_data'])
         info = data['info']
         
-        # Process 36 Quarters of Financial Data via SEC EDGAR
         q_summary, accel_start_q = process_36q_fundamentals(ticker_input, data['q_financials'])
         pattern_info = detect_chart_patterns_and_sell_signals(df_price)
 
@@ -782,11 +774,12 @@ if ticker_input and ticker_input != "N/A":
         with tab_fund:
             if not q_summary.empty:
                 st.markdown(f"### Extended Quarterly Fundamental History ({len(q_summary)} Quarters Loaded)")
-                st.caption("Displays Quarterly Sales, Quarterly EPS, Same-Quarter Prior-Year EPS Growth, and Trailing Twelve Months (TTM) Totals derived from SEC 10-Q filings (Most Recent at Top).")
+                st.caption("Displays Quarterly Sales, Quarterly Revenue Growth, Quarterly EPS, EPS Growth, and Trailing Twelve Months (TTM) Totals derived from SEC 10-Q filings (Most Recent at Top).")
                 
                 display_df = q_summary.copy()
                 
                 display_df['Quarterly Revenue'] = display_df['Quarterly Revenue ($)'].apply(format_large_number)
+                display_df['Revenue Growth'] = display_df['Quarterly Revenue Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['Quarterly EPS'] = display_df['Quarterly EPS ($)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
                 display_df['QoQ EPS Growth'] = display_df['QoQ EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
                 display_df['YoY EPS Growth'] = display_df['YoY EPS Growth (%)'].apply(lambda x: format_pct(x) if pd.notnull(x) else "—")
@@ -794,7 +787,7 @@ if ticker_input and ticker_input != "N/A":
                 display_df['Annual EPS (TTM)'] = display_df['Annual EPS (TTM)'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "—")
 
                 cols_to_show = [
-                    'Quarter / Date', 'Quarterly Revenue',
+                    'Quarter / Date', 'Quarterly Revenue', 'Revenue Growth',
                     'Quarterly EPS', 'QoQ EPS Growth', 'YoY EPS Growth',
                     'Annual Sales (TTM)', 'Annual EPS (TTM)', 'Status Indicator'
                 ]
